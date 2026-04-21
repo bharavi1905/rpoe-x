@@ -1,0 +1,176 @@
+name: rpoe-x
+version: "0.1.0"
+description: >
+  RPOE-X: Multi-Agent Rotary Parking Optimization Environment — Extended.
+  Simulates 5 zones across the HITEC City corridor (Hyderabad) with 20 rotary
+  parking wheels and 240 total slots. A hierarchical agent system (1 orchestrator
+  + 5 zone agents) learns to minimize wait time and balance load across zones
+  under realistic time-varying demand derived from GHMC parking data.
+
+tags:
+  - openenv
+  - multi-agent
+  - parking
+  - urban-mobility
+  - reinforcement-learning
+
+agents:
+  - id: orchestrator
+    count: 1
+    role: "Routes incoming parking requests to one of 5 zones"
+  - id: zone_agent
+    count: 5
+    role: "Assigns requests within a zone to a specific wheel"
+
+action_space:
+  orchestrator:
+    type: discrete
+    description: "Route incoming car to a zone"
+    fields:
+      - name: action
+        type: string
+        values: ["route_to_zone"]
+      - name: zone_id
+        type: integer
+        range: [0, 4]
+  zone_agent:
+    type: discrete
+    description: "Assign car to a wheel within the zone"
+    fields:
+      - name: action
+        type: string
+        values: ["assign_to_wheel"]
+      - name: wheel_id
+        type: integer
+        range: [0, 4]
+        note: "Upper bound depends on zone (3–5 wheels per zone)"
+
+observation_space:
+  orchestrator:
+    fields:
+      - name: zone_occupancy
+        type: List[float]
+        shape: [5]
+        range: [0.0, 1.0]
+        description: "Fraction of slots filled per zone"
+      - name: zone_queue_lengths
+        type: List[int]
+        shape: [5]
+        description: "Arrival + retrieval queue depth per zone"
+      - name: zone_avg_wait
+        type: List[float]
+        shape: [5]
+        description: "Mean wait steps per zone"
+      - name: arrival_rate_ema
+        type: List[float]
+        shape: [5]
+        description: "Exponential moving average of recent arrivals per zone"
+      - name: recent_delta_queue
+        type: List[float]
+        shape: [5]
+        description: "Queue trend per zone (positive = growing)"
+      - name: time_of_day
+        type: float
+        range: [0.0, 1.0]
+        description: "Normalized time (0=7AM, 1=11PM)"
+      - name: step
+        type: integer
+        description: "Current environment step"
+      - name: done
+        type: boolean
+        description: "Whether episode has ended"
+      - name: reward
+        type: float
+        description: "Reward signal for this step"
+  zone_agent:
+    fields:
+      - name: zone_id
+        type: integer
+        range: [0, 4]
+        description: "Which zone this observation belongs to"
+      - name: wheel_occupancy
+        type: List[float]
+        description: "Fraction of slots filled per wheel in this zone"
+      - name: wheel_queue_lengths
+        type: List[int]
+        description: "Pending request queue depth per wheel"
+      - name: est_rotation_cost
+        type: List[float]
+        description: "Estimated steps to service next request per wheel"
+      - name: local_arrival_rate_ema
+        type: float
+        description: "Zone-level arrival EMA"
+      - name: time_of_day
+        type: float
+        range: [0.0, 1.0]
+      - name: step
+        type: integer
+      - name: done
+        type: boolean
+      - name: reward
+        type: float
+
+reward:
+  formula: "R = -avg_wait_time + 0.01 * throughput - 0.02 * zone_imbalance"
+  components:
+    - name: avg_wait_time
+      weight: -1.0
+      description: "Mean wait steps across all queued cars this step"
+    - name: throughput
+      weight: 0.01
+      description: "Count of successful park + retrieve operations this step"
+    - name: zone_imbalance
+      weight: -0.02
+      description: "Std deviation of zone occupancy fractions"
+
+environment:
+  max_steps: 960
+  step_unit: "1 minute"
+  simulation_window: "7AM–11PM (16 hours)"
+  zones: 5
+  wheels_per_zone: [4, 4, 5, 4, 3]
+  slots_per_wheel: 12
+  total_wheels: 20
+  total_slots: 240
+  overflow_timeout_steps: 10
+  dwell_mean_steps: 480
+  dwell_std_steps: 120
+
+tasks:
+  - id: task1_easy
+    difficulty: easy
+    max_steps: 200
+    description: "Quiet demand routing. Score = throughput rate."
+    pass_threshold: 0.50
+  - id: task2_medium
+    difficulty: medium
+    max_steps: 400
+    description: "Peak hour surge. Score = 0.60×throughput + 0.40×balance."
+    pass_threshold: 0.55
+  - id: task3_hard
+    difficulty: hard
+    max_steps: 1080
+    description: "Full 18-hour day. Composite: throughput + wait + balance."
+    pass_threshold: 0.60
+
+server:
+  host: "0.0.0.0"
+  port: 7860
+  entrypoint: "server.app:app"
+  framework: fastapi
+
+inference:
+  entrypoint: "inference.py"
+  env_vars:
+    - name: API_BASE_URL
+      default: "https://api.openai.com/v1"
+    - name: MODEL_NAME
+      default: "gpt-4o-mini"
+    - name: HF_TOKEN
+      required: true
+      description: "HuggingFace token — used as LLM API key"
+
+docker:
+  base_image: "python:3.14-slim"
+  expose: 7860
+  package_manager: uv

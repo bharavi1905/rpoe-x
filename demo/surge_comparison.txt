@@ -1,0 +1,19 @@
+RPOE-X Surge Scenario — 9AM Peak Hour (Steps 55–105)
+Zone 0 = Cyber Towers (fills fastest, multiplier=1.5)
+Zone 2 = Hitech City Metro (largest buffer, 5 wheels)
+
+  Step | Greedy Zone0 Q | RL Zone0 Q | Greedy Zone2 Q | RL Zone2 Q | Greedy OVF | RL OVF
+----------------------------------------------------------------------------------------
+    55 |              0 |  0 healthy |              0 |          0 |          8 |      2
+    65 |              3 |  0 healthy |              1 |          4 |          8 |      2
+    75 |     9 CRITICAL |  2 healthy |              6 |          4 |         20 |     12
+    85 |              0 |  0 healthy |              2 |          1 |         46 |     37
+    95 |              4 |  0 healthy |              0 |          4 |         57 |     51
+   105 |     8 CRITICAL |  1 healthy |              2 |          6 |         77 |     66
+----------------------------------------------------------------------------------------
+Final overflow — Greedy: 107  |  RL: 94
+
+KEY INSIGHT: RL agent routes to Zone 2 (Metro buffer) BEFORE
+Zone 0 saturates. Greedy only reacts after overflow begins.
+
+This is predictive routing vs reactive routing.

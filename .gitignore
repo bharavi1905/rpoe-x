@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+baseline_scores.json
+CLAUDE.md
+BACKLOG.md
