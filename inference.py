@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import os
 import json
-import time
+import sys
 
+import numpy as np
+from dotenv import load_dotenv
 from openai import OpenAI
 
-from models import OrchestratorObs, OrchestratorAction, ZoneObs, ZoneAction, TaskResult
-from server.env import RPOEXEnv
+load_dotenv()
+
+from models import OrchestratorObs, OrchestratorAction, TaskResult
+from server.env import RPOEXEnv, _open_score
 from tasks.graders import (
     TASKS, greedy_orchestrator, greedy_zone,
-    run_task1, run_task2, run_task3,
 )
 
 # ---------------------------------------------------------------------------
@@ -35,8 +38,11 @@ def llm_orchestrator(obs: OrchestratorObs) -> OrchestratorAction:
     Uses LLM to decide which zone to route the next incoming car to.
     Falls back to greedy if LLM call fails or returns invalid zone_id.
     """
-    system_prompt = """You are an orchestrator agent for a multi-zone rotary parking system in HITEC City, Hyderabad.
-Your job: choose which zone (0–4) to route the next incoming parking request to.
+    system_prompt = """You are an orchestrator agent for a rotary parking system in HITEC City, Hyderabad.
+Each step you park ONE car in ONE zone. If you route to a zone with no waiting cars, the step is wasted.
+CRITICAL RULE: Always route to a zone that has cars waiting (zone_queue_lengths > 0).
+If multiple zones have queued cars, prefer the zone with the longest queue to minimize overflow timeouts.
+If no zone has queued cars, route to zone 2 (largest buffer).
 Zones: 0=Cyber Towers, 1=Inorbit Mall, 2=Hitech City Metro (largest), 3=Mindspace, 4=Kondapur.
 Respond with ONLY a JSON object: {"zone_id": <int 0-4>}
 No explanation. No markdown. Just the JSON."""
@@ -68,7 +74,8 @@ Which zone_id (0–4) should the next car be routed to?"""
         if zone_id < 0 or zone_id > 4:
             raise ValueError(f"zone_id {zone_id} out of range")
         return OrchestratorAction(action="route_to_zone", zone_id=zone_id)
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] LLM fallback at step {obs.step}: {e}", file=sys.stderr)
         return greedy_orchestrator(obs)
 
 # ---------------------------------------------------------------------------
@@ -102,27 +109,88 @@ def run_task_with_logging(
     """
     Runs a full task episode with [START]/[STEP]/[END] stdout logging.
     Stdout format is mandatory per competition spec — do not change.
+    Single episode run — logging and scoring happen together.
     """
     task_meta = TASKS[task_id]
     max_steps = task_meta["steps"]
+    lambda_override = 0.05 if task_id == "task1_easy" else None
 
     print(f"[START] task_id={task_id} model={MODEL_NAME}")
 
-    env = RPOEXEnv(seed=seed, max_steps=max_steps)
+    env = RPOEXEnv(seed=seed, max_steps=max_steps, lambda_override=lambda_override)
     obs = env.reset(seed=seed)
 
-    step = 0
+    zone_occ_snapshots: list = []
+    wait_snapshots: list = []
+
     while not obs.done:
         orch_action, zone_id, zone_action = hybrid_agent(obs, env, use_llm=use_llm)
-        obs = env.step(orch_action)
+        obs = env.step(orch_action, zone_action)
         print(f"[STEP] step={obs.step} action=route_to_zone:{zone_id} reward={obs.reward:.4f} done={obs.done}")
-        step += 1
+        if env._step % 10 == 0:
+            zone_occ_snapshots.append(list(obs.zone_occupancy))
+            wait_snapshots.append(float(np.mean(obs.zone_avg_wait)))
 
-    def agent_fn(o, e):
-        return hybrid_agent(o, e, use_llm=False)
+    total_ops = env._parked + env._retrieved
+    throughput_rate = total_ops / max_steps if max_steps > 0 else 0.0
 
-    result: TaskResult = task_meta["fn"](agent_fn, seed=seed)
-    return result
+    if zone_occ_snapshots:
+        imbalances = [float(np.std(snap)) for snap in zone_occ_snapshots]
+        avg_imbalance = float(np.mean(imbalances))
+    else:
+        avg_imbalance = 0.0
+    balance_score = max(0.0, 1.0 - avg_imbalance / 0.5)
+
+    avg_wait = float(np.mean(wait_snapshots)) if wait_snapshots else 0.0
+    wait_score = max(0.0, 1.0 - min(avg_wait / 20.0, 1.0))
+
+    if task_id == "task1_easy":
+        total_arrived = env._parked + env._overflowed
+        service_rate = env._parked / max(1, total_arrived)
+        score = _open_score(service_rate)
+        return TaskResult(
+            task_id=task_id, score=score, passed=score >= 0.50,
+            metrics={
+                "service_rate": round(service_rate, 4),
+                "total_parked": float(env._parked),
+                "total_retrieved": float(env._retrieved),
+                "total_overflowed": float(env._overflowed),
+                "total_arrived": float(total_arrived),
+            },
+            notes=f"Quiet demand λ=0.05. service_rate={service_rate:.4f}",
+        )
+    elif task_id == "task2_medium":
+        raw = 0.60 * throughput_rate + 0.40 * balance_score
+        score = _open_score(raw)
+        return TaskResult(
+            task_id=task_id, score=score, passed=score >= 0.55,
+            metrics={
+                "throughput_rate": round(throughput_rate, 4),
+                "balance_score": round(balance_score, 4),
+                "avg_imbalance": round(avg_imbalance, 4),
+                "total_parked": float(env._parked),
+                "total_retrieved": float(env._retrieved),
+                "total_overflowed": float(env._overflowed),
+            },
+            notes=f"throughput={throughput_rate:.4f} balance={balance_score:.4f}",
+        )
+    else:  # task3_hard
+        raw = 0.50 * throughput_rate + 0.30 * balance_score + 0.20 * wait_score
+        score = _open_score(raw)
+        return TaskResult(
+            task_id=task_id, score=score, passed=score >= 0.60,
+            metrics={
+                "throughput_rate": round(throughput_rate, 4),
+                "balance_score": round(balance_score, 4),
+                "wait_score": round(wait_score, 4),
+                "avg_wait": round(avg_wait, 4),
+                "avg_imbalance": round(avg_imbalance, 4),
+                "total_parked": float(env._parked),
+                "total_retrieved": float(env._retrieved),
+                "total_overflowed": float(env._overflowed),
+            },
+            notes=f"throughput={throughput_rate:.4f} balance={balance_score:.4f} wait={wait_score:.4f}",
+        )
 
 # ---------------------------------------------------------------------------
 # PART E — Main entry point

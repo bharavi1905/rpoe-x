@@ -89,9 +89,10 @@ def _open_score(score: float) -> float:
 
 class RPOEXEnv(_BaseEnv):
 
-    def __init__(self, seed: int = 42, max_steps: int = MAX_STEPS):
+    def __init__(self, seed: int = 42, max_steps: int = MAX_STEPS, lambda_override: float = None):
         self._seed = seed
         self._max_steps = max_steps
+        self._lambda_override = lambda_override
         self._rng = np.random.default_rng(seed)
         self._slots: List[List[List[Optional[str]]]] = []
         self._arrival_q: List[List[CarState]] = []
@@ -180,7 +181,7 @@ class RPOEXEnv(_BaseEnv):
     def _process_arrivals(self) -> int:
         """Stochastic arrivals for current step. Returns total new arrivals."""
         hour = _current_hour_offset(self._step)
-        base_rate = _arrival_rate(hour)
+        base_rate = self._lambda_override if self._lambda_override is not None else _arrival_rate(hour)
         total_new = 0
         for z in range(5):
             lam = base_rate * ZONES[z]["multiplier"]
@@ -281,14 +282,13 @@ class RPOEXEnv(_BaseEnv):
             seed=self._seed,
         )
 
-    def step(self, action: OrchestratorAction, timeout_s: Optional[float] = None, **kwargs) -> OrchestratorObs:
+    def step(self, action: OrchestratorAction, zone_action=None, timeout_s: Optional[float] = None, **kwargs) -> OrchestratorObs:
         """
         One environment step. Order of operations:
         1. Stochastic arrivals
         2. Overflow timeout check
         3. Dwell timer → retrieval queue
-        4. Process orchestrator action: route one car from zone's arrival queue
-           to a wheel (pick least occupied wheel in that zone)
+        4. Orchestrator routes zone; zone agent picks wheel within that zone
         5. Process one retrieval per zone (FIFO from retrieval queue)
         6. Compute reward
         7. Advance step counter
@@ -308,14 +308,18 @@ class RPOEXEnv(_BaseEnv):
         throughput_this_step = 0
         if self._arrival_q[z]:
             car = self._arrival_q[z].pop(0)
-            best_wheel = min(
-                range(ZONES[z]["wheels"]),
-                key=lambda w: sum(1 for s in self._slots[z][w] if s is not None)
-            )
+            # Use zone agent's wheel choice if provided and valid; else fall back to least-occupied
+            if zone_action is not None and 0 <= zone_action.wheel_id < ZONES[z]["wheels"]:
+                chosen_wheel = zone_action.wheel_id
+            else:
+                chosen_wheel = min(
+                    range(ZONES[z]["wheels"]),
+                    key=lambda w: sum(1 for s in self._slots[z][w] if s is not None)
+                )
             parked = False
             for s in range(WHEEL_SIZE):
-                if self._slots[z][best_wheel][s] is None:
-                    self._slots[z][best_wheel][s] = car.car_id
+                if self._slots[z][chosen_wheel][s] is None:
+                    self._slots[z][chosen_wheel][s] = car.car_id
                     self._parked += 1
                     throughput_this_step += 1
                     dwell = _sample_dwell(self._rng)
@@ -323,6 +327,7 @@ class RPOEXEnv(_BaseEnv):
                     parked = True
                     break
             if not parked:
+                # Chosen wheel is full — overflow this car
                 self._overflowed += 1
 
         # 5. Process one retrieval per zone (FIFO)
@@ -378,8 +383,17 @@ class RPOEXEnv(_BaseEnv):
         for w in range(n_wheels):
             filled = sum(1 for s in self._slots[z][w] if s is not None)
             w_occ.append(round(filled / WHEEL_SIZE, 4))
-            w_ql.append(0)
-            w_rc.append(float(_rotation_cost(self._front_slot[z][w], 0)))
+            # filled slots as effective queue depth — drives greedy away from full wheels
+            w_ql.append(filled)
+            # rotation cost to nearest empty slot; WHEEL_SIZE signals wheel is full
+            rc = WHEEL_SIZE
+            for d in range(1, WHEEL_SIZE + 1):
+                cw  = (self._front_slot[z][w] + d) % WHEEL_SIZE
+                ccw = (self._front_slot[z][w] - d) % WHEEL_SIZE
+                if self._slots[z][w][cw] is None or self._slots[z][w][ccw] is None:
+                    rc = d
+                    break
+            w_rc.append(float(rc))
         return ZoneObs(
             zone_id=z,
             wheel_occupancy=w_occ,

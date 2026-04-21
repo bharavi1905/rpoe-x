@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server.env import RPOEXEnv
 from models import OrchestratorAction, OrchestratorObs
-from tasks.graders import greedy_orchestrator, greedy_zone, run_task2
+from tasks.graders import greedy_orchestrator, greedy_zone
 
 # ---------------------------------------------------------------------------
 # PART A — Policy (linear softmax over orchestrator obs)
@@ -73,7 +73,8 @@ def run_reinforce_episode(
     while not obs.done:
         zone_id, log_prob = policy.forward(obs)
         action = OrchestratorAction(action="route_to_zone", zone_id=zone_id)
-        obs = env.step(action)
+        zone_action = greedy_zone(env.get_zone_obs(zone_id))
+        obs = env.step(action, zone_action)
         log_probs.append((log_prob, policy._obs_to_vec(obs), zone_id))
         rewards.append(obs.reward)
 
@@ -116,7 +117,8 @@ def run_greedy_episode(seed: int, max_steps: int = 400) -> float:
     total_reward = 0.0
     while not obs.done:
         action = greedy_orchestrator(obs)
-        obs = env.step(action)
+        zone_action = greedy_zone(env.get_zone_obs(action.zone_id))
+        obs = env.step(action, zone_action)
         total_reward += obs.reward
     return float(total_reward)
 

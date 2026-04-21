@@ -56,19 +56,20 @@ def _run_episode(
     agent: AgentFn,
     seed: int,
     max_steps: int,
+    lambda_override: float = None,
 ) -> dict:
     """
     Run one full episode. Returns raw metrics dict:
       total_parked, total_retrieved, total_overflowed,
       total_reward, step_count
     """
-    env = RPOEXEnv(seed=seed, max_steps=max_steps)
+    env = RPOEXEnv(seed=seed, max_steps=max_steps, lambda_override=lambda_override)
     obs = env.reset(seed=seed)
     total_reward = 0.0
     step_count = 0
     while not obs.done:
         orch_action, zone_id, zone_action = agent(obs, env)
-        obs = env.step(orch_action)
+        obs = env.step(orch_action, zone_action)
         total_reward += obs.reward
         step_count += 1
     return {
@@ -89,35 +90,30 @@ TASK1_STEPS = 200
 
 def run_task1(agent: AgentFn, seed: int = 42) -> TaskResult:
     """
-    task1_easy — Quiet demand routing.
-    Score = throughput_rate = total_parked / max_possible_parked
-    max_possible_parked = TASK1_STEPS (one park per step upper bound)
+    task1_easy — Quiet demand routing (λ=0.05 flat).
+    Score = service_rate = total_parked / (total_parked + total_overflowed)
     Pass threshold: 0.50
     """
-    metrics = _run_episode(agent, seed=seed, max_steps=TASK1_STEPS)
+    metrics = _run_episode(agent, seed=seed, max_steps=TASK1_STEPS, lambda_override=0.05)
 
-    total_ops = metrics["total_parked"] + metrics["total_retrieved"]
-    max_possible = TASK1_STEPS
-    throughput_rate = total_ops / max_possible if max_possible > 0 else 0.0
-
-    overflow_penalty = metrics["total_overflowed"] / max(1, metrics["total_parked"] + metrics["total_overflowed"])
-    raw_score = throughput_rate * (1.0 - 0.5 * overflow_penalty)
-    score = _open_score(raw_score)
+    total_arrived = metrics["total_parked"] + metrics["total_overflowed"]
+    service_rate = metrics["total_parked"] / max(1, total_arrived)
+    score = _open_score(service_rate)
     passed = score >= 0.50
 
     return TaskResult(
         task_id="task1_easy",
         score=score,
         metrics={
-            "throughput_rate":  round(throughput_rate, 4),
-            "overflow_penalty": round(overflow_penalty, 4),
+            "service_rate":     round(service_rate, 4),
             "total_parked":     float(metrics["total_parked"]),
             "total_retrieved":  float(metrics["total_retrieved"]),
             "total_overflowed": float(metrics["total_overflowed"]),
+            "total_arrived":    float(total_arrived),
             "total_reward":     metrics["total_reward"],
         },
         passed=passed,
-        notes=f"Quiet demand. throughput_rate={throughput_rate:.4f} overflow_penalty={overflow_penalty:.4f}",
+        notes=f"Quiet demand λ=0.05. service_rate={service_rate:.4f}",
     )
 
 
@@ -144,7 +140,7 @@ def run_task2(agent: AgentFn, seed: int = 42) -> TaskResult:
 
     while not obs.done:
         orch_action, zone_id, zone_action = agent(obs, env)
-        obs = env.step(orch_action)
+        obs = env.step(orch_action, zone_action)
         total_reward += obs.reward
         if env._step % 10 == 0:
             zone_occ_snapshots.append(list(obs.zone_occupancy))
@@ -212,7 +208,7 @@ def run_task3(agent: AgentFn, seed: int = 42) -> TaskResult:
 
     while not obs.done:
         orch_action, zone_id, zone_action = agent(obs, env)
-        obs = env.step(orch_action)
+        obs = env.step(orch_action, zone_action)
         total_reward += obs.reward
         if env._step % 10 == 0:
             zone_occ_snapshots.append(list(obs.zone_occupancy))
