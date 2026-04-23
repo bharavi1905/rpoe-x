@@ -105,6 +105,10 @@ class RPOEXEnv(_BaseEnv):
         self._parked: int = 0
         self._retrieved: int = 0
         self._overflowed: int = 0
+        self._zone_parked: List[int] = [0] * 5        # per-step (for [ZONE] log)
+        self._zone_overflowed: List[int] = [0] * 5   # per-step (for [ZONE] log)
+        self._zone_parked_total: List[int] = [0] * 5
+        self._zone_overflowed_total: List[int] = [0] * 5
         self._episode_id: str = ""
         self._car_counter: int = 0
         if _BaseEnv is not object:
@@ -132,9 +136,13 @@ class RPOEXEnv(_BaseEnv):
         self._retrieved   = 0
         self._overflowed  = 0
         self._car_counter = 0
-        self._ema         = [0.0] * 5
-        self._prev_queue  = [0] * 5
-        self._episode_id  = episode_id or str(uuid.uuid4())[:8]
+        self._ema             = [0.0] * 5
+        self._prev_queue      = [0] * 5
+        self._zone_parked          = [0] * 5
+        self._zone_overflowed      = [0] * 5
+        self._zone_parked_total    = [0] * 5
+        self._zone_overflowed_total= [0] * 5
+        self._episode_id           = episode_id or str(uuid.uuid4())[:8]
 
         return self._make_orchestrator_obs(reward=0.0, done=False)
 
@@ -282,7 +290,7 @@ class RPOEXEnv(_BaseEnv):
             seed=self._seed,
         )
 
-    def step(self, action: OrchestratorAction, zone_action=None, timeout_s: Optional[float] = None, **kwargs) -> OrchestratorObs:
+    def step(self, action: OrchestratorAction, zone_action: Optional[ZoneAction] = None, timeout_s: Optional[float] = None, **kwargs) -> OrchestratorObs:
         """
         One environment step. Order of operations:
         1. Stochastic arrivals
@@ -294,6 +302,10 @@ class RPOEXEnv(_BaseEnv):
         7. Advance step counter
         8. Return OrchestratorObs
         """
+        # Reset per-step zone counters
+        self._zone_parked     = [0] * 5
+        self._zone_overflowed = [0] * 5
+
         # 1. Arrivals
         self._process_arrivals()
 
@@ -321,6 +333,8 @@ class RPOEXEnv(_BaseEnv):
                 if self._slots[z][chosen_wheel][s] is None:
                     self._slots[z][chosen_wheel][s] = car.car_id
                     self._parked += 1
+                    self._zone_parked[z] += 1
+                    self._zone_parked_total[z] += 1
                     throughput_this_step += 1
                     dwell = _sample_dwell(self._rng)
                     self._dwell_timers[car.car_id] = self._step + dwell
@@ -329,6 +343,8 @@ class RPOEXEnv(_BaseEnv):
             if not parked:
                 # Chosen wheel is full — overflow this car
                 self._overflowed += 1
+                self._zone_overflowed[z] += 1
+                self._zone_overflowed_total[z] += 1
 
         # 5. Process one retrieval per zone (FIFO)
         for z in range(5):
@@ -394,6 +410,12 @@ class RPOEXEnv(_BaseEnv):
                     rc = d
                     break
             w_rc.append(float(rc))
+        # Service rate over the episode: fraction of cars parked vs (parked + overflowed).
+        # Shifted to [-0.5, +0.5] so 0 = break-even, positive = healthy, negative = overflowing.
+        total_served = self._zone_parked_total[z] + self._zone_overflowed_total[z]
+        zone_reward = round(
+            self._zone_parked_total[z] / max(1, total_served) - 0.5, 6
+        )
         return ZoneObs(
             zone_id=z,
             wheel_occupancy=w_occ,
@@ -403,7 +425,7 @@ class RPOEXEnv(_BaseEnv):
             time_of_day=round(_current_hour_offset(self._step) / 16.0, 4),
             step=self._step,
             done=self._step >= self._max_steps,
-            reward=0.0,
+            reward=zone_reward,
         )
 
 

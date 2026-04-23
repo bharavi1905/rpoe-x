@@ -5,3 +5,4 @@ __pycache__/
 baseline_scores.json
 CLAUDE.md
 BACKLOG.md
+training/trained_rpoe_x_agent_adapter/

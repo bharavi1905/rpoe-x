@@ -2,7 +2,7 @@
 name = "rpoe-x"
 version = "0.1.0"
 description = "RPOE-X: Multi-Agent Rotary Parking Optimization Environment"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "openenv-core",
     "fastapi",
@@ -12,6 +12,12 @@ dependencies = [
     "python-dotenv",
     "openai",
     "matplotlib>=3.10.8",
+    "transformers>=5.6.1",
+    "torch>=2.11.0",
+    "accelerate>=1.13.0",
+    "mlx-lm>=0.31.3",
+    "dataset>=2.0.0",
+    "datasets>=4.8.4",
 ]
 
 [project.scripts]
