@@ -1,13 +1,3 @@
-"""
-model_client — auto-selects the best available inference backend.
-
-Priority: MLX (Apple Silicon) → CUDA → MPS → CPU → OpenAI-compatible API
-
-Usage:
-    import model_client
-    model_client.init_model()
-    response = model_client.call_model(messages, max_tokens=20)
-"""
 from __future__ import annotations
 
 import os
@@ -22,92 +12,38 @@ load_dotenv()
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen3-1.7B")
 HF_TOKEN     = os.getenv("HF_TOKEN")    # NO default — must be set externally
-MODEL_PATH   = os.getenv("MODEL_PATH")  # base model HF ID or local directory (optional)
-ADAPTER_PATH = os.getenv("ADAPTER_PATH")  # LoRA adapter directory (optional, MLX only)
+MODEL_PATH   = os.getenv("MODEL_PATH")  # local model directory (optional)
 
 _client = OpenAI(api_key=HF_TOKEN or "sk-placeholder", base_url=API_BASE_URL)
 
-_BACKEND         = "api"   # resolved by init_model()
-_local_model     = None    # transformers model  (cuda / mps / cpu)
-_local_tokenizer = None    # transformers tokenizer
-_mlx_model       = None    # mlx_lm model        (Apple Silicon)
-_mlx_tokenizer   = None    # mlx_lm tokenizer
-
-
-def _detect_backend() -> str:
-    if not MODEL_PATH and not ADAPTER_PATH:
-        return "api"
-    try:
-        import mlx.core as mx
-        if mx.metal.is_available():
-            return "mlx"
-    except ImportError:
-        pass
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda"
-        if torch.backends.mps.is_available():
-            return "mps"
-    except ImportError:
-        pass
-    return "cpu"
+_local_model     = None
+_local_tokenizer = None
 
 
 def init_model() -> None:
-    """Load the model on the best available backend. Call once at startup."""
-    global _BACKEND, _local_model, _local_tokenizer, _mlx_model, _mlx_tokenizer
+    """Load a local transformers model if MODEL_PATH is set, otherwise use API."""
+    global _local_model, _local_tokenizer
 
-    _BACKEND = _detect_backend()
-    if _BACKEND == "api":
+    if not MODEL_PATH:
         return
 
-    print(f"[INFO] Backend: {_BACKEND}  model: {MODEL_PATH}", file=sys.stderr)
-
-    if _BACKEND == "mlx":
-        try:
-            from mlx_lm import load as mlx_load
-            base = MODEL_PATH or MODEL_NAME
-            kwargs = {"adapter_path": ADAPTER_PATH} if ADAPTER_PATH else {}
-            _mlx_model, _mlx_tokenizer = mlx_load(base, **kwargs)
-            adapter_msg = f" + adapter {ADAPTER_PATH}" if ADAPTER_PATH else ""
-            print(f"[INFO] MLX model ready: {base}{adapter_msg}", file=sys.stderr)
-            return
-        except Exception as e:
-            print(f"[WARN] MLX load failed, falling back to CPU: {e}", file=sys.stderr)
-            _BACKEND = "cpu"
-
-    # Transformers path — cuda / mps / cpu
     try:
         import torch
         from transformers import AutoTokenizer, AutoModelForCausalLM
-        dtype = torch.float16 if _BACKEND == "cuda" else torch.float32
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype  = torch.float16 if device == "cuda" else torch.float32
         _local_tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
         _local_model = AutoModelForCausalLM.from_pretrained(
             MODEL_PATH, torch_dtype=dtype,
-        ).to(_BACKEND)
-        print(f"[INFO] Transformers model ready on {_BACKEND}", file=sys.stderr)
+        ).to(device)
+        print(f"[INFO] Local model ready on {device}: {MODEL_PATH}", file=sys.stderr)
     except Exception as e:
         print(f"[WARN] Failed to load local model: {e}", file=sys.stderr)
 
 
 def call_model(messages: list, max_tokens: int = 20) -> str:
-    """Route inference to the active backend: MLX → transformers → API."""
-
-    if _BACKEND == "mlx" and _mlx_model is not None:
-        from mlx_lm import generate as mlx_generate
-        prompt = _mlx_tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False,
-            enable_thinking=False,              # disable Qwen3 chain-of-thought
-        )
-        raw = mlx_generate(
-            _mlx_model, _mlx_tokenizer,
-            prompt=prompt, max_tokens=max_tokens, verbose=False,
-        )
-        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-        if not raw:
-            raise ValueError("empty response from MLX model")
-        return raw
+    """Run inference via local transformers model or OpenAI-compatible API."""
 
     if _local_model is not None and _local_tokenizer is not None:
         import torch
@@ -128,7 +64,6 @@ def call_model(messages: list, max_tokens: int = 20) -> str:
         ).strip()
         return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
 
-    # OpenAI-compatible API — HF Inference Router, OpenAI, local vLLM, etc.
     response = _client.chat.completions.create(
         model=MODEL_NAME, messages=messages,
         max_tokens=max_tokens, temperature=0.0,

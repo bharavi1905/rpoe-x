@@ -20,6 +20,16 @@ pinned: false
 
 ---
 
+## Links
+
+| Deliverable | URL |
+|---|---|
+| HF Space (live environment) | https://huggingface.co/spaces/bharavivillu/rpoe-x |
+| Training notebook (GRPO) | [training/rpoe_x_training.ipynb](training/rpoe_x_training.ipynb) |
+| Blog post | [blog.md](blog.md) |
+
+---
+
 ## One-Line Pitch
 
 RPOE-X teaches a hierarchy of AI agents to route cars across 5 rotary parking
@@ -151,27 +161,43 @@ R = -avg_wait_time + 0.01 × throughput - 0.02 × zone_imbalance
 
 ## Baseline Scores
 
+### LLM Orchestrator (gpt-4o-mini)
+
 | Task | Score | Passed |
 |---|---|---|
-| task1_easy | 0.2255 | False |
-| task2_medium | 0.5284 | False |
-| task3_hard | 0.5958 | False |
-| **Average** | **0.4499** | — |
+| task1_easy | 0.9821 | ✅ |
+| task2_medium | 0.5744 | ✅ |
+| task3_hard | 0.7454 | ✅ |
+| **Average** | **0.7673** | — |
 
-Model: gpt-4o-mini
+### Greedy Baseline
 
-These are the greedy-fallback scores (no HF_TOKEN set). With the LLM
-orchestrator active, scores improve as the agent routes toward Zone 2
-during surge periods. The training curve shows the RL improvement signal.
+| Task | Score | Passed |
+|---|---|---|
+| task1_easy | 0.2549 | ❌ |
+| task2_medium | 0.5284 | ❌ |
+| task3_hard | 0.5958 | ❌ |
+| **Average** | **0.4597** | — |
+
+The greedy agent routes to zones with lowest queue, wasting steps on empty
+zones. The LLM orchestrator (and trained small model) learn to route only
+to zones with queued cars — this is the learnable behavior RPOE-X tests.
 
 ---
 
-## Training Curve
+## Training
+
+**Algorithm:** GRPO (Group Relative Policy Optimization) via HuggingFace TRL + Unsloth  
+**Base model:** `Qwen/Qwen2.5-0.5B-Instruct`  
+**Training notebook:** [training/rpoe_x_training.ipynb](training/rpoe_x_training.ipynb)
+
+The small base model starts at greedy level (~0.25 service rate on task1)
+and improves to 0.70+ after GRPO training — learning to route to zones
+with queued cars instead of wasting steps on empty zones.
 
 ![Training Curve](training/training_curve.png)
 
-REINFORCE agent (3 seeds, shaded ±1 std) vs greedy baseline (dashed).
-X-axis: episodes. Y-axis: total episode reward.
+Left: GRPO reward during training. Right: Before/after service rate comparison.
 
 ---
 
@@ -264,9 +290,11 @@ rpoe_x/
 ├── tasks/
 │   └── graders.py        # run_task1/2/3, greedy baseline, TASKS registry
 ├── training/
-│   ├── train.py          # REINFORCE training loop
-│   ├── plot_curve.py     # Training curve PNG generator
-│   └── curves.json       # Output of train.py
+│   ├── rpoe_x_training.ipynb  # GRPO training notebook (Unsloth + HF TRL)
+│   ├── training_curve.png     # Reward curve committed as image
+│   ├── train.py               # REINFORCE loop (reference)
+│   ├── plot_curve.py          # Training curve PNG generator
+│   └── curves.json            # Output of train.py
 ├── demo/
 │   ├── surge_scenario.py # 9AM surge comparison: RL vs greedy
 │   └── surge_comparison.txt

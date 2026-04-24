@@ -34,6 +34,12 @@ class ZoneAction(Action):
     wheel_id: int = Field(ge=0, description="Target wheel index within the zone (>= 0; upper bound enforced by env)")
 
 
+class CombinedAction(Action):
+    action: Literal["route_to_zone"] = Field(default="route_to_zone", description="Always 'route_to_zone'")
+    zone_id: int = Field(ge=0, le=4, description="Target zone (0=Cyber Towers, 1=Inorbit, 2=Hitech Metro, 3=Mindspace, 4=Kondapur)")
+    wheel_id: int = Field(ge=0, description="Target wheel within the chosen zone (0-based local index)")
+
+
 class ZoneObs(Observation):
     zone_id: int = Field(description="Zone index this observation belongs to (0–4)")
     wheel_occupancy: List[float] = Field(description="Occupancy ratio 0.0–1.0 per wheel in this zone")
