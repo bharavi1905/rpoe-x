@@ -14,17 +14,17 @@ except Exception as e:
         "openenv-core is required. Run: uv sync"
     ) from e
 
-from models import CombinedAction, OrchestratorAction, OrchestratorObs, ZoneAction, TaskResult
+from models import ParkingAction, OrchestratorAction, OrchestratorObs, ZoneAction, TaskResult
 from server.env import RPOEXEnv, ZONES
 from tasks.graders import TASKS, greedy_orchestrator, greedy_zone
 
 
 # ---------------------------------------------------------------------------
-# Wrapper env: exposes CombinedAction(zone_id, wheel_id) to the Gradio UI
+# Wrapper env: exposes ParkingAction(zone_id, wheel_id) to the Gradio UI
 # ---------------------------------------------------------------------------
 
 class RPOEXEnvUI(RPOEXEnv):
-    def step(self, action: CombinedAction) -> OrchestratorObs:  # type: ignore[override]
+    def step(self, action: ParkingAction) -> OrchestratorObs:  # type: ignore[override]
         orch_action  = OrchestratorAction(action="route_to_zone", zone_id=action.zone_id)
         zone_action  = ZoneAction(action="assign_to_wheel", wheel_id=action.wheel_id)
         return super().step(orch_action, zone_action)
@@ -36,7 +36,7 @@ class RPOEXEnvUI(RPOEXEnv):
 
 app = create_app(
     RPOEXEnvUI,
-    CombinedAction,
+    ParkingAction,
     OrchestratorObs,
     env_name="rpoe-x",
     max_concurrent_envs=1,

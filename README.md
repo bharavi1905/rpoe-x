@@ -291,10 +291,7 @@ rpoe_x/
 │   └── graders.py        # run_task1/2/3, greedy baseline, TASKS registry
 ├── training/
 │   ├── rpoe_x_training.ipynb  # GRPO training notebook (Unsloth + HF TRL)
-│   ├── training_curve.png     # Reward curve committed as image
-│   ├── train.py               # REINFORCE loop (reference)
-│   ├── plot_curve.py          # Training curve PNG generator
-│   └── curves.json            # Output of train.py
+│   └── training_curve.png     # Reward curve (committed image)
 ├── demo/
 │   ├── surge_scenario.py # 9AM surge comparison: RL vs greedy
 │   └── surge_comparison.txt

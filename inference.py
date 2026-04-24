@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import model_client
-from model_client import API_BASE_URL, MODEL_NAME, HF_TOKEN, MODEL_PATH  # Gate 2  # noqa: F401
+from model_client import API_BASE_URL, MODEL_NAME, HF_TOKEN  # Gate 2  # noqa: F401
 from models import OrchestratorObs, OrchestratorAction, ZoneObs, ZoneAction, TaskResult
 from server.env import RPOEXEnv, _open_score
 from tasks.graders import TASKS, greedy_orchestrator, greedy_zone
@@ -22,11 +22,12 @@ from tasks.graders import TASKS, greedy_orchestrator, greedy_zone
 def llm_orchestrator(obs: OrchestratorObs) -> OrchestratorAction:
     system_prompt = (
         "You are an orchestrator agent for a rotary parking system in HITEC City, Hyderabad.\n"
-        "Each step you route ONE car to ONE zone. Routing to an empty zone wastes the step.\n"
-        "RULE: Route to a zone with cars waiting (zone_queue_lengths > 0). Prefer the busiest zone.\n"
-        "If no zone has cars, use zone 2 (Hitech Metro — largest buffer).\n"
-        "Zones: 0=Cyber Towers, 1=Inorbit Mall, 2=Hitech Metro, 3=Mindspace, 4=Kondapur.\n"
-        'Respond ONLY with: {"zone_id": <int 0-4>} /no_think'
+        "Each step you route ONE car to ONE zone.\n"
+        "RULE 1: Look at zone_queue_lengths. Route to the zone with the highest queue.\n"
+        "RULE 2: Never route to a zone with queue_length=0 unless ALL zones are empty.\n"
+        "RULE 3: If all queues are 0, pick zone 2 (largest buffer).\n"
+        "Zones: 0=Cyber Towers(4 wheels), 1=Inorbit(4), 2=Metro(5), 3=Mindspace(4), 4=Kondapur(3).\n"
+        'Respond ONLY with valid JSON: {"zone_id": <int 0-4>} /no_think'
     )
 
     user_msg = (
@@ -173,15 +174,12 @@ def run_task_with_logging(task_id: str, use_llm: bool, seed: int = 42) -> TaskRe
 # ---------------------------------------------------------------------------
 
 def main():
-    model_client.init_model()
-    use_llm = MODEL_PATH is not None or (HF_TOKEN is not None and HF_TOKEN.strip() != "")
-
     results      = {}
     total_score  = 0.0
     run_start    = time.time()
 
     for task_id in ["task1_easy", "task2_medium", "task3_hard"]:
-        result = run_task_with_logging(task_id, use_llm=use_llm, seed=42)
+        result = run_task_with_logging(task_id, use_llm=True, seed=42)
         results[task_id] = result
         total_score += result.score
         elapsed = result.metrics.get("elapsed_s", 0.0)
