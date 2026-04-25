@@ -1,0 +1,34 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.env
+.venv
+venv/
+
+# md files
+CLAUDE.md
+BACKLOG.md
+blog.md
+
+# Git
+.git/
+.gitignore
+
+# OS files
+.DS_Store
+
+# Logs
+*.log
+
+# Training artifacts (large / not needed for Space)
+training/training_curve.png
+
+# Tests (optional - not needed for runtime)
+tests/
+
+# Misc
+*.zip
+*.tar
