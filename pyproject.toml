@@ -1,5 +1,5 @@
 [project]
-name = "rpoe-x"
+name = "rpoe_x"
 version = "0.1.0"
 description = "RPOE-X: Multi-Agent Rotary Parking Optimization Environment"
 requires-python = ">=3.11"
