@@ -11,9 +11,14 @@ load_dotenv()
 
 import model_client
 from model_client import API_BASE_URL, MODEL_NAME, HF_TOKEN  # Gate 2  # noqa: F401
-from models import OrchestratorObs, OrchestratorAction, ZoneObs, ZoneAction, TaskResult
-from server.env import RPOEXEnv, _open_score
-from tasks.graders import TASKS, greedy_orchestrator, greedy_zone
+try:
+    from rpoe_x.models import OrchestratorObs, OrchestratorAction, ZoneObs, ZoneAction, TaskResult
+    from rpoe_x.server.env import RPOEXEnv, _open_score
+    from rpoe_x.tasks.graders import TASKS, greedy_orchestrator, greedy_zone
+except ImportError:
+    from models import OrchestratorObs, OrchestratorAction, ZoneObs, ZoneAction, TaskResult
+    from server.env import RPOEXEnv, _open_score
+    from tasks.graders import TASKS, greedy_orchestrator, greedy_zone
 
 # ---------------------------------------------------------------------------
 # Orchestrator agent

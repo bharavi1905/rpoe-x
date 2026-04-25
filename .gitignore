@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 .venv/
+build/
+dist/
+*.egg-info/
 baseline_scores.json
 CLAUDE.md
 BACKLOG.md

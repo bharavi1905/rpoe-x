@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import os
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import uvicorn
 from fastapi import HTTPException
 
@@ -14,9 +10,14 @@ except Exception as e:
         "openenv-core is required. Run: uv sync"
     ) from e
 
-from models import ParkingAction, OrchestratorAction, OrchestratorObs, ZoneAction, TaskResult
-from server.env import RPOEXEnv, ZONES
-from tasks.graders import TASKS, greedy_orchestrator, greedy_zone
+try:
+    from ..models import ParkingAction, OrchestratorAction, OrchestratorObs, ZoneAction, TaskResult
+    from .env import RPOEXEnv, ZONES
+    from ..tasks.graders import TASKS, greedy_orchestrator, greedy_zone
+except ImportError:
+    from models import ParkingAction, OrchestratorAction, OrchestratorObs, ZoneAction, TaskResult
+    from server.env import RPOEXEnv, ZONES
+    from tasks.graders import TASKS, greedy_orchestrator, greedy_zone
 
 
 # ---------------------------------------------------------------------------

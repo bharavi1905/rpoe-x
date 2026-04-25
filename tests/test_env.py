@@ -1,13 +1,13 @@
 import pytest
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from server.env import RPOEXEnv, _rotation_cost, _open_score, ZONES
-from models import OrchestratorAction, OrchestratorObs, ZoneObs, TaskResult
-from tasks.graders import (
-    run_task1, run_task2, run_task3,
-    greedy_orchestrator, greedy_zone,
-)
+try:
+    from rpoe_x.server.env import RPOEXEnv, _rotation_cost, _open_score, ZONES
+    from rpoe_x.models import OrchestratorAction, OrchestratorObs, ZoneObs, TaskResult
+    from rpoe_x.tasks.graders import run_task1, run_task2, run_task3, greedy_orchestrator, greedy_zone
+except ImportError:
+    from server.env import RPOEXEnv, _rotation_cost, _open_score, ZONES
+    from models import OrchestratorAction, OrchestratorObs, ZoneObs, TaskResult
+    from tasks.graders import run_task1, run_task2, run_task3, greedy_orchestrator, greedy_zone
 
 
 # ── Test 1 ──────────────────────────────────────────────────────────────────

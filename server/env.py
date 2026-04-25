@@ -6,12 +6,16 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from models import (
-    OrchestratorObs, ZoneObs, ZoneAction, OrchestratorAction,
-    CarState, WheelState, ZoneState, RPOEXState, TaskResult,
-)
+try:
+    from ..models import (
+        OrchestratorObs, ZoneObs, ZoneAction, OrchestratorAction,
+        CarState, WheelState, ZoneState, RPOEXState,
+    )
+except ImportError:
+    from models import (
+        OrchestratorObs, ZoneObs, ZoneAction, OrchestratorAction,
+        CarState, WheelState, ZoneState, RPOEXState,
+    )
 
 try:
     from openenv.core.env_server.interfaces import Environment as _BaseEnv

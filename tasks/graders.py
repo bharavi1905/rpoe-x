@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import time
 from typing import Callable, Tuple
 
-from models import (
-    OrchestratorAction, OrchestratorObs,
-    ZoneAction, ZoneObs, TaskResult,
-)
-from server.env import RPOEXEnv, _open_score, ZONES
+try:
+    from ..models import (
+        OrchestratorAction, OrchestratorObs,
+        ZoneAction, ZoneObs, TaskResult,
+    )
+    from ..server.env import RPOEXEnv, _open_score
+except ImportError:
+    from models import (
+        OrchestratorAction, OrchestratorObs,
+        ZoneAction, ZoneObs, TaskResult,
+    )
+    from server.env import RPOEXEnv, _open_score
 
 # ---------------------------------------------------------------------------
 # PART A — Greedy baseline agents
