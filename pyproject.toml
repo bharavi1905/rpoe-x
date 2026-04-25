@@ -11,6 +11,9 @@ dependencies = [
     "numpy",
     "python-dotenv",
     "openai",
+    "trl>=0.29.0",
+    "peft",
+    "matplotlib>=3.10.9",
 ]
 
 [project.scripts]
@@ -23,6 +26,8 @@ build-backend = "setuptools.build_meta"
 [project.optional-dependencies]
 train = [
     "trl>=0.15.0",
+    "vllm==0.11.2",
+    "torch>=2.8.0,<2.10.0",
     "peft",
     "transformers",
     "datasets",

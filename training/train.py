@@ -4,8 +4,9 @@ Importable as: from rpoe_x.training.train import (
     ORCH_SYSTEM, ZONE_SYSTEM,
     format_orch_obs, format_zone_obs,
     parse_action,
-    format_reward, routing_reward, wheel_reward,
-    collect_episode,
+    reward_total,
+    rollout_once,
+    build_rollout_func,
     plot_rewards,
 )
 """
@@ -34,21 +35,53 @@ ZONE_NAMES = ["Cyber Towers", "Inorbit Mall", "Hitech Metro", "Mindspace", "Kond
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
-ORCH_SYSTEM = (
-    "You are an orchestrator agent for a rotary parking system in HITEC City, Hyderabad.\n"
-    "Each step you route ONE car to ONE zone. Routing to an empty zone wastes the step.\n"
-    "RULE: Route to a zone with cars waiting (zone_queue_lengths > 0). Prefer the busiest zone.\n"
-    "If no zone has cars, use zone 2 (Hitech Metro — largest buffer).\n"
-    "Zones: 0=Cyber Towers, 1=Inorbit Mall, 2=Hitech Metro, 3=Mindspace, 4=Kondapur.\n"
-    'Respond ONLY with: {"zone_id": <int 0-4>} /no_think'
-)
+ORCH_SYSTEM = """\
+You are the Orchestrator Agent for RPOE-X, a rotary parking system in HITEC City, Hyderabad.
 
-ZONE_SYSTEM = (
-    "You are a zone agent for a rotary parking system.\n"
-    "Assign the incoming car to the best wheel in your zone.\n"
-    "RULE: Never pick a full wheel (occupancy=1.0 or queue_length=12). Pick the least-occupied wheel.\n"
-    'Respond ONLY with: {"wheel_id": <int>} /no_think'
-)
+ZONES:
+  0 = Cyber Towers Junction
+  1 = Inorbit Mall Signal
+  2 = Hitech City Metro
+  3 = Mindspace Junction
+  4 = Kondapur / Whitefields
+
+YOUR JOB: Each step, route ONE incoming car to ONE zone by choosing its zone_id.
+Goal: keep wait times low and throughput high across all zones.
+
+OBSERVATIONS (received each step):
+  zone_occupancy[z]      — fraction of slots filled in zone z (0.0 = empty, 1.0 = full)
+  zone_queue_lengths[z]  — cars currently waiting to be parked in zone z
+  zone_avg_wait[z]       — average steps cars have been waiting in zone z
+  arrival_rate_ema[z]    — recent arrival rate trend for zone z
+  time_of_day            — normalized time (0.0 = start, 1.0 = end of operating hours)
+
+HARD CONSTRAINT:
+  Do not route to a zone where zone_occupancy >= 0.98 — it has no remaining capacity.
+
+OUTPUT — respond with exactly this JSON and nothing else:
+{"zone_id": <integer 0 to 4>}
+/no_think"""
+
+ZONE_SYSTEM = """\
+You are a Zone Agent for RPOE-X, a rotary parking system in HITEC City, Hyderabad.
+
+YOUR JOB: A car has been routed to your zone. Assign it to the best available wheel.
+Goal: minimize service time and avoid overflow penalties.
+
+OBSERVATIONS (received each step):
+  zone_id                  — which zone you are managing (0–4)
+  wheel_occupancy[w]       — fraction of the 12 slots filled on wheel w (0.0 = empty, 1.0 = full)
+  wheel_queue_lengths[w]   — filled slot count per wheel (12 means the wheel is completely full)
+  est_rotation_cost[w]     — steps to rotate to the nearest empty slot (higher = slower service)
+  time_of_day              — normalized time of day
+
+HARD CONSTRAINT:
+  Never assign to a wheel where wheel_occupancy >= 0.99 or wheel_queue_lengths >= 12.
+  Doing so causes an overflow — the car is lost and a penalty is applied.
+
+OUTPUT — respond with exactly this JSON and nothing else:
+{"wheel_id": <integer>}
+/no_think"""
 
 # ── Observation formatters ────────────────────────────────────────────────────
 
@@ -102,143 +135,80 @@ def parse_action(completion: str) -> dict[str, Any] | None:
     return None
 
 
-# ── Reward functions ──────────────────────────────────────────────────────────
+# ── Pass-through TRL reward function ─────────────────────────────────────────
 
 
-def format_reward(completions: list[str], agent_role: list[str], **kwargs) -> list[float]:
-    """Reward valid JSON with the correct key for each agent role."""
-    rewards = []
-    for comp, role in zip(completions, agent_role):
-        parsed = parse_action(comp)
-        if parsed is None:
-            rewards.append(-1.0)
-        elif role == "orchestrator" and "zone_id" in parsed:
-            z = int(parsed.get("zone_id", -1))
-            rewards.append(0.5 if 0 <= z <= 4 else -1.0)
-        elif role == "zone" and "wheel_id" in parsed:
-            w = int(parsed.get("wheel_id", -1))
-            rewards.append(0.5 if w >= 0 else -1.0)
-        else:
-            rewards.append(-1.0)
-    return rewards
+def reward_total(completions: list[str], **kwargs) -> list[float]:
+    """Pass-through: rewards were captured during rollout, not recomputed here."""
+    rewards = kwargs.get("total_reward")
+    return [float(r) for r in rewards] if rewards else [0.0 for _ in completions]
 
 
-def routing_reward(
-    completions: list[str],
-    agent_role: list[str],
-    zone_queue_lengths: list[str],
-    **kwargs,
-) -> list[float]:
-    """Reward routing to zones with queued cars; penalise routing to empty zones.
+# ── Rollout — one full parking episode ───────────────────────────────────────
 
-    zone_queue_lengths is stored as a JSON string in the dataset to avoid
-    TRL collation errors with variable-length lists.
+
+async def rollout_once(
+    trainer,
+    env,
+    tokenizer,
+    max_turns: int = 50,
+) -> dict[str, list]:
+    """Run one parking episode. Reward comes entirely from env.step() — no recomputation.
+
+    Each turn: orchestrator picks zone_id, zone agent picks wheel_id, env.step() returns reward.
+    Invalid-output penalties (-0.5 / -0.1) are applied here in rollout, not in reward_funcs.
+    Token ids from both agents are accumulated into one sequence per episode.
     """
-    rewards = []
-    for comp, role, ql_raw in zip(completions, agent_role, zone_queue_lengths):
-        ql = json.loads(ql_raw) if isinstance(ql_raw, str) else ql_raw
-        if role != "orchestrator" or not ql:
-            rewards.append(0.0)
-            continue
-        parsed = parse_action(comp)
-        if parsed is None or "zone_id" not in parsed:
-            rewards.append(-0.5)
-            continue
-        z = int(parsed["zone_id"])
-        if not (0 <= z <= 4):
-            rewards.append(-1.0)
-            continue
-        total = sum(ql)
-        if total == 0:
-            rewards.append(0.0)
-        elif ql[z] == 0:
-            rewards.append(-0.5)
-        else:
-            rewards.append(min(1.0, ql[z] / total + 0.3))
-    return rewards
+    from trl.experimental.openenv import generate_rollout_completions
 
-
-def wheel_reward(
-    completions: list[str],
-    agent_role: list[str],
-    wheel_occupancy: list[str],
-    n_wheels: list[int],
-    **kwargs,
-) -> list[float]:
-    """Penalise full-wheel assignments; reward choosing low-occupancy wheels.
-
-    wheel_occupancy is stored as a JSON string in the dataset to avoid
-    TRL collation errors with variable-length lists.
-    """
-    rewards = []
-    for comp, role, occ_raw, nw in zip(completions, agent_role, wheel_occupancy, n_wheels):
-        occ = json.loads(occ_raw) if isinstance(occ_raw, str) else occ_raw
-        if role != "zone" or not occ:
-            rewards.append(0.0)
-            continue
-        parsed = parse_action(comp)
-        if parsed is None or "wheel_id" not in parsed:
-            rewards.append(-0.5)
-            continue
-        w = int(parsed["wheel_id"])
-        if not (0 <= w < nw):
-            rewards.append(-1.0)
-            continue
-        occ_val = occ[w]
-        rewards.append(-0.8 if occ_val >= 0.99 else max(0.5, 1.0 - occ_val))
-    return rewards
-
-
-# ── Episode collector ─────────────────────────────────────────────────────────
-
-
-async def collect_episode(env, tokenizer, max_turns: int = 50) -> list[dict]:
-    """Run one greedy episode; return rows for GRPO training.
-
-    The prompt column is pre-formatted via tokenizer.apply_chat_template so
-    it's stored as a string — TRL's GRPOTrainer requires a string prompt column.
-
-    Variable-length list columns (zone_queue_lengths, wheel_occupancy) are
-    JSON-serialised to avoid TRL batch-collation errors.
-    """
-    rows = []
     result = await env.reset()
     obs = result.observation
-    done = False
+
+    prompt_ids: list[int] = []
+    completion_ids: list[int] = []
+    logprobs: list[float] = []
+    step_rewards: list[float] = []
 
     for _ in range(max_turns):
-        if done:
+        if result.done:
             break
-        ql = list(obs.zone_queue_lengths)
-        zo = list(obs.zone_occupancy)
 
-        # Orchestrator training row
+        # ── Orchestrator turn ─────────────────────────────────────────────────
         orch_obs_dict = {
-            "zone_occupancy": zo,
-            "zone_queue_lengths": ql,
-            "zone_avg_wait": list(obs.zone_avg_wait),
-            "arrival_rate_ema": list(obs.arrival_rate_ema),
-            "time_of_day": obs.time_of_day,
-            "step": obs.step,
+            "zone_occupancy":    list(obs.zone_occupancy),
+            "zone_queue_lengths": list(obs.zone_queue_lengths),
+            "zone_avg_wait":     list(obs.zone_avg_wait),
+            "arrival_rate_ema":  list(obs.arrival_rate_ema),
+            "time_of_day":       obs.time_of_day,
+            "step":              obs.step,
         }
-        orch_messages = [
-            {"role": "system", "content": ORCH_SYSTEM},
-            {"role": "user", "content": format_orch_obs(orch_obs_dict)},
-        ]
-        rows.append({
-            "prompt": tokenizer.apply_chat_template(
-                orch_messages, add_generation_prompt=True, tokenize=False
-            ),
-            "agent_role": "orchestrator",
-            "zone_queue_lengths": json.dumps(ql),
-            "wheel_occupancy": json.dumps([]),
-            "n_wheels": 0,
-        })
+        orch_prompt = tokenizer.apply_chat_template(
+            [{"role": "system", "content": ORCH_SYSTEM},
+             {"role": "user",   "content": format_orch_obs(orch_obs_dict)}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        orch_out = generate_rollout_completions(trainer, [orch_prompt])[0]
+        prompt_ids.extend(orch_out["prompt_ids"])
+        completion_ids.extend(orch_out["completion_ids"])
+        logprobs.extend(orch_out["logprobs"])
 
-        # Greedy zone selection; estimate wheel occupancy from zone-level signal
-        zone_id = max(range(5), key=lambda z: ql[z])
+        orch_text = orch_out.get("text") or tokenizer.decode(
+            orch_out["completion_ids"], skip_special_tokens=True
+        )
+        parsed_orch = parse_action(orch_text)
+
+        if parsed_orch is None or "zone_id" not in parsed_orch:
+            step_rewards.append(-0.5)
+            continue
+        zone_id = int(parsed_orch["zone_id"])
+        if not (0 <= zone_id <= 4):
+            step_rewards.append(-1.0)
+            continue
+
+        # ── Zone agent turn ───────────────────────────────────────────────────
         n_wheels = ZONE_WHEEL_COUNTS[zone_id]
-        base_occ = zo[zone_id]
+        base_occ = list(obs.zone_occupancy)[zone_id]
         wheel_occ = [
             max(0.0, min(1.0, base_occ + random.gauss(0, 0.15)))
             for _ in range(n_wheels)
@@ -247,40 +217,96 @@ async def collect_episode(env, tokenizer, max_turns: int = 50) -> list[dict]:
             wheel_occ[random.randint(0, n_wheels - 1)] = random.uniform(0.1, 0.5)
 
         zone_obs_dict = {
-            "zone_id": zone_id,
-            "wheel_occupancy": wheel_occ,
+            "zone_id":            zone_id,
+            "wheel_occupancy":    wheel_occ,
             "wheel_queue_lengths": [max(0, int(w * 12)) for w in wheel_occ],
-            "est_rotation_cost": [max(1.0, (1.0 - w) * 12) for w in wheel_occ],
-            "time_of_day": obs.time_of_day,
-            "step": obs.step,
+            "est_rotation_cost":  [max(1.0, (1.0 - w) * 12) for w in wheel_occ],
+            "time_of_day":        obs.time_of_day,
+            "step":               obs.step,
         }
-        zone_messages = [
-            {"role": "system", "content": ZONE_SYSTEM},
-            {"role": "user", "content": format_zone_obs(zone_obs_dict)},
-        ]
-        rows.append({
-            "prompt": tokenizer.apply_chat_template(
-                zone_messages, add_generation_prompt=True, tokenize=False
-            ),
-            "agent_role": "zone",
-            "zone_queue_lengths": json.dumps([]),
-            "wheel_occupancy": json.dumps(wheel_occ),
-            "n_wheels": n_wheels,
-        })
+        zone_prompt = tokenizer.apply_chat_template(
+            [{"role": "system", "content": ZONE_SYSTEM},
+             {"role": "user",   "content": format_zone_obs(zone_obs_dict)}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        zone_out = generate_rollout_completions(trainer, [zone_prompt])[0]
+        prompt_ids.extend(zone_out["prompt_ids"])
+        completion_ids.extend(zone_out["completion_ids"])
+        logprobs.extend(zone_out["logprobs"])
 
-        wheel_id = min(range(n_wheels), key=lambda w: wheel_occ[w])
-        step_result = await env.step(ParkingAction(zone_id=zone_id, wheel_id=wheel_id))
-        obs = step_result.observation
-        done = step_result.done
+        zone_text = zone_out.get("text") or tokenizer.decode(
+            zone_out["completion_ids"], skip_special_tokens=True
+        )
+        parsed_zone = parse_action(zone_text)
 
-    return rows
+        if parsed_zone is None or "wheel_id" not in parsed_zone:
+            step_rewards.append(-0.5)
+            continue
+        wheel_id = int(parsed_zone["wheel_id"])
+        if not (0 <= wheel_id < n_wheels):
+            step_rewards.append(-1.0)
+            continue
+
+        # ── Env step — sole reward source ─────────────────────────────────────
+        try:
+            result = await env.step(ParkingAction(zone_id=zone_id, wheel_id=wheel_id))
+            step_rewards.append(float(result.reward or 0.0))
+            obs = result.observation
+        except Exception as e:
+            logger.warning(f"env.step error: {e}")
+            step_rewards.append(-0.1)
+            break
+
+    total_reward = sum(step_rewards) if step_rewards else -1.0
+    return {
+        "prompt_ids":     prompt_ids,
+        "completion_ids": completion_ids,
+        "logprobs":       logprobs,
+        "total_reward":   total_reward,
+    }
+
+
+def build_rollout_func(env_url: str, tokenizer, max_turns: int = 50):
+    """Return a GRPOTrainer-compatible rollout_func.
+
+    Creates a fresh ParkingEnv connection per episode so rollout_func
+    (which is called synchronously by TRL) can drive the async env.
+    Requires nest_asyncio in Colab — call nest_asyncio.apply() before training.
+    """
+    import asyncio
+
+    from ..client import ParkingEnv
+
+    async def _run_episode(trainer) -> dict:
+        async with ParkingEnv(base_url=env_url) as env:
+            return await rollout_once(trainer, env, tokenizer, max_turns)
+
+    def rollout_func(prompts: list[str], trainer) -> dict[str, list]:
+        loop = asyncio.get_event_loop()
+        ep_prompt_ids, ep_completion_ids, ep_logprobs, total_rewards = [], [], [], []
+        for _ in prompts:
+            episode = loop.run_until_complete(_run_episode(trainer))
+            ep_prompt_ids.append(episode["prompt_ids"])
+            ep_completion_ids.append(episode["completion_ids"])
+            ep_logprobs.append(episode["logprobs"])
+            total_rewards.append(episode["total_reward"])
+            logger.info(f"episode reward={episode['total_reward']:.3f}")
+        return {
+            "prompt_ids":     ep_prompt_ids,
+            "completion_ids": ep_completion_ids,
+            "logprobs":       ep_logprobs,
+            "total_reward":   total_rewards,
+        }
+
+    return rollout_func
 
 
 # ── Reward curve plotter ──────────────────────────────────────────────────────
 
 
 def plot_rewards(trainer, save_path: str) -> None:
-    """Save and display the GRPO reward curve from trainer log history."""
+    """Save the GRPO reward curve from trainer log history."""
     import matplotlib.pyplot as plt
 
     steps, rewards = [], []
