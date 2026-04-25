@@ -20,10 +20,21 @@ server = "rpoe_x.server.app:main"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[project.optional-dependencies]
+train = [
+    "trl>=0.15.0",
+    "peft",
+    "transformers",
+    "datasets",
+    "unsloth",
+    "numpy",
+    "matplotlib",
+]
+
 [tool.setuptools]
 include-package-data = true
-packages = ["rpoe_x", "rpoe_x.server", "rpoe_x.tasks"]
-package-dir = {"rpoe_x" = ".", "rpoe_x.server" = "server", "rpoe_x.tasks" = "tasks"}
+packages = ["rpoe_x", "rpoe_x.server", "rpoe_x.tasks", "rpoe_x.training"]
+package-dir = {"rpoe_x" = ".", "rpoe_x.server" = "server", "rpoe_x.tasks" = "tasks", "rpoe_x.training" = "training"}
 
 [dependency-groups]
 dev = [
