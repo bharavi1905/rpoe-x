@@ -86,13 +86,17 @@ def parse_action(completion: str) -> dict[str, Any] | None:
     text = re.sub(r"<think>.*?</think>", "", completion, flags=re.DOTALL).strip()
     text = re.sub(r"```.*?```", "", text, flags=re.DOTALL).strip()
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
     except json.JSONDecodeError:
         pass
     matches = re.findall(r"\{[^{}]*\}", text)
     if matches:
         try:
-            return json.loads(matches[-1])
+            result = json.loads(matches[-1])
+            if isinstance(result, dict):
+                return result
         except json.JSONDecodeError:
             pass
     return None
