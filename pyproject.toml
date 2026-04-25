@@ -25,13 +25,12 @@ build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
 train = [
-    "trl>=0.15.0",
-    "vllm==0.11.2",
+    "trl>=0.29.0",
     "torch>=2.8.0,<2.10.0",
+    "bitsandbytes",
     "peft",
     "transformers",
     "datasets",
-    "unsloth",
     "numpy",
     "matplotlib",
 ]
