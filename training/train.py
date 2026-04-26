@@ -289,22 +289,94 @@ async def collect_episode(env, tokenizer, max_turns: int = 50) -> list[dict]:
     return rows
 
 
+# ── Model agent (for pre/post-training evaluation) ────────────────────────────
+
+
+def model_agent(model, tokenizer, temperature: float = 0.0, max_new_tokens: int = 32):
+    """Return an AgentFn that drives the task runner using model+tokenizer.
+
+    The returned callable has signature: (obs, env) -> (OrchestratorAction, zone_id, ZoneAction)
+    which is exactly what run_task1/2/3 expect.
+
+    Falls back to greedy_orchestrator / greedy_zone on any parse failure so
+    evaluation always completes even if the model produces malformed output.
+
+    Args:
+        model:          A HuggingFace / Unsloth CausalLM in eval mode.
+        tokenizer:      Matching tokenizer (pad_token must be set).
+        temperature:    0.0 = greedy decoding (deterministic, recommended for eval).
+        max_new_tokens: Budget for the action JSON — 32 is plenty.
+    """
+    import torch
+
+    try:
+        from ..models import OrchestratorAction, ZoneAction
+        from ..tasks.graders import greedy_orchestrator, greedy_zone
+    except ImportError:
+        from models import OrchestratorAction, ZoneAction
+        from tasks.graders import greedy_orchestrator, greedy_zone
+
+    device = next(model.parameters()).device
+
+    def _call(system: str, user: str) -> dict | None:
+        messages = [{"role": "system", "content": system},
+                    {"role": "user",   "content": user}]
+        prompt  = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
+        inputs  = tokenizer(prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                max_new_tokens  = max_new_tokens,
+                do_sample       = temperature > 0,
+                temperature     = temperature if temperature > 0 else None,
+                pad_token_id    = tokenizer.pad_token_id,
+            )
+        new_ids = out[0, inputs["input_ids"].shape[1]:]
+        return parse_action(tokenizer.decode(new_ids, skip_special_tokens=True))
+
+    def agent(obs, env):
+        # ── Orchestrator ──────────────────────────────────────────────────
+        orch_obs = {
+            "zone_occupancy":    list(obs.zone_occupancy),
+            "zone_queue_lengths": list(obs.zone_queue_lengths),
+            "zone_avg_wait":     list(obs.zone_avg_wait),
+            "arrival_rate_ema":  list(obs.arrival_rate_ema),
+            "time_of_day":       obs.time_of_day,
+            "step":              obs.step,
+        }
+        parsed = _call(ORCH_SYSTEM, format_orch_obs(orch_obs))
+        if parsed and "zone_id" in parsed and 0 <= int(parsed["zone_id"]) <= 4:
+            zone_id     = int(parsed["zone_id"])
+            orch_action = OrchestratorAction(action="route_to_zone", zone_id=zone_id)
+        else:
+            orch_action = greedy_orchestrator(obs)
+            zone_id     = orch_action.zone_id
+
+        # ── Zone agent ────────────────────────────────────────────────────
+        zo       = env.get_zone_obs(zone_id)
+        n_wheels = len(zo.wheel_occupancy)
+        zone_obs = {
+            "zone_id":            zo.zone_id,
+            "wheel_occupancy":    list(zo.wheel_occupancy),
+            "wheel_queue_lengths": list(zo.wheel_queue_lengths),
+            "est_rotation_cost":  list(zo.est_rotation_cost),
+            "time_of_day":        zo.time_of_day,
+            "step":               zo.step,
+        }
+        parsed = _call(ZONE_SYSTEM, format_zone_obs(zone_obs))
+        if parsed and "wheel_id" in parsed and 0 <= int(parsed["wheel_id"]) < n_wheels:
+            zone_action = ZoneAction(action="assign_to_wheel", wheel_id=int(parsed["wheel_id"]))
+        else:
+            zone_action = greedy_zone(zo)
+
+        return orch_action, zone_id, zone_action
+
+    return agent
+
+
 # ── Plotting ──────────────────────────────────────────────────────────────────
-
-# Known baseline scores — used in the before/after task score panel.
-BASELINE_SCORES = {
-    "greedy":  [0.2549, 0.5284, 0.5958],
-    "gpt4o":   [0.9821, 0.5744, 0.7454],
-    "before":  [0.25,   0.47,   0.55],   # small model epoch 0 ≈ greedy
-    "after":   [0.65,   0.70,   0.68],   # target after GRPO
-    "thresh":  [0.50,   0.55,   0.60],
-}
-
-# 9AM surge routing distribution used in the routing-shift panel.
-SURGE_ROUTING = {
-    "greedy":  [62, 18,  6, 10,  4],
-    "trained": [22, 20, 38, 13,  7],
-}
 
 
 def _smooth(arr: np.ndarray, w: int | None = None) -> tuple[np.ndarray, np.ndarray, int]:
@@ -316,20 +388,39 @@ def _smooth(arr: np.ndarray, w: int | None = None) -> tuple[np.ndarray, np.ndarr
     return s, np.arange(len(s), dtype=float), w
 
 
-def plot_dashboard(trainer, output_dir: str, window: int | None = None) -> str:
-    """Four-panel storytelling dashboard saved to output_dir/training_dashboard.png.
+def plot_dashboard(
+    trainer,
+    output_dir: str,
+    window: int | None = None,
+    task_scores: dict | None = None,
+    surge_routing: dict | None = None,
+) -> str:
+    """Training dashboard saved to output_dir/training_dashboard.png.
 
-    Panels:
-      1. Total GRPO reward curve (raw + smoothed, start/end annotations)
-      2. Task scores before vs after GRPO vs greedy vs GPT-4o-mini
-      3. Reward signal decomposition (format / routing / wheel)
-      4. 9AM surge zone routing shift (greedy vs trained)
+    Always renders:
+      Panel 1 — Total GRPO reward curve (raw + smoothed)
+      Panel 3 — Reward signal decomposition (format / routing / wheel)
+
+    Renders only when real evaluated data is passed in:
+      Panel 2 — Task scores before vs after (requires task_scores dict)
+      Panel 4 — 9AM surge zone routing shift (requires surge_routing dict)
+
+    task_scores keys: "greedy", "before", "after", "thresh"
+                      each a list of 3 floats [task1, task2, task3]
+
+    surge_routing keys: "greedy", "trained"
+                        each a list of 5 ints (% routed per zone)
 
     Returns the path to the saved PNG.
     """
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
     import os
+
+    has_scores = task_scores is not None
+    has_surge  = surge_routing is not None
+    has_right  = has_scores or has_surge
+    n_cols     = 2 if has_right else 1
 
     # ── Extract log history ────────────────────────────────────────────────
     steps, total_r = [], []
@@ -361,10 +452,10 @@ def plot_dashboard(trainer, output_dir: str, window: int | None = None) -> str:
     rte_arr = _fill(rte_r, 0.50)
     whl_arr = _fill(whl_r, 0.20)
 
-    s_tot, s_idx, w = _smooth(r_arr, window)
-    s_fmt, _, _     = _smooth(fmt_arr, w)
-    s_rte, _, _     = _smooth(rte_arr, w)
-    s_whl, _, _     = _smooth(whl_arr, w)
+    s_tot, _, w = _smooth(r_arr, window)
+    s_fmt, _, _ = _smooth(fmt_arr, w)
+    s_rte, _, _ = _smooth(rte_arr, w)
+    s_whl, _, _ = _smooth(whl_arr, w)
     s_x = steps_arr[w - 1:]
 
     # ── Dark theme ─────────────────────────────────────────────────────────
@@ -398,30 +489,30 @@ def plot_dashboard(trainer, output_dir: str, window: int | None = None) -> str:
         "legend.labelcolor":  TEXT_C,
     })
 
-    fig = plt.figure(figsize=(20, 13), facecolor=DARK_BG)
+    fig_w = 20 if has_right else 13
+    fig = plt.figure(figsize=(fig_w, 13), facecolor=DARK_BG)
     fig.suptitle(
         "RPOE-X  ·  GRPO Training Dashboard\n"
         "Qwen2.5-0.5B  ·  HITEC City Rotary Parking  ·  OpenEnv Hackathon 2026",
         fontsize=17, fontweight="bold", color=TEXT_C, y=0.98,
     )
-    gs = GridSpec(2, 3, figure=fig,
+    gs = GridSpec(2, n_cols, figure=fig,
                   hspace=0.48, wspace=0.36,
                   left=0.06, right=0.97, top=0.91, bottom=0.07)
 
-    # ── Panel 1 (top, 2-col): Total reward curve ───────────────────────────
-    ax1 = fig.add_subplot(gs[0, :2])
-    ax1.grid(axis="y", linewidth=0.5, alpha=0.4)
-    ax1.plot(steps_arr, r_arr,  color=CYAN, alpha=0.18, linewidth=0.9, label="Raw")
-    ax1.plot(s_x,       s_tot,  color=CYAN, linewidth=2.8, label="Smoothed")
-    ax1.fill_between(s_x, 0, s_tot, where=(s_tot > 0), color=CYAN, alpha=0.10)
-    ax1.fill_between(s_x, s_tot, 0, where=(s_tot < 0), color=RED,  alpha=0.10)
-    ax1.axhline(0, color=DIM_C, linewidth=0.8, linestyle="--", alpha=0.6)
-
-    n_a = max(3, len(s_tot) // 8)
+    n_a     = max(3, len(s_tot) // 8)
     start_v = float(np.mean(s_tot[:n_a]))
     end_v   = float(np.mean(s_tot[-n_a:]))
     delta   = (end_v - start_v) / max(abs(start_v), 1e-6) * 100
 
+    # ── Panel 1: Total reward curve ────────────────────────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.grid(axis="y", linewidth=0.5, alpha=0.4)
+    ax1.plot(steps_arr, r_arr, color=CYAN, alpha=0.18, linewidth=0.9, label="Raw")
+    ax1.plot(s_x,       s_tot, color=CYAN, linewidth=2.8, label="Smoothed")
+    ax1.fill_between(s_x, 0, s_tot, where=(s_tot > 0), color=CYAN, alpha=0.10)
+    ax1.fill_between(s_x, s_tot, 0, where=(s_tot < 0), color=RED,  alpha=0.10)
+    ax1.axhline(0, color=DIM_C, linewidth=0.8, linestyle="--", alpha=0.6)
     ax1.annotate(f"Epoch 0\n{start_v:+.3f}",
                  xy=(s_x[n_a // 2], s_tot[n_a // 2]),
                  xytext=(s_x[n_a // 2], start_v - 0.55),
@@ -437,55 +528,50 @@ def plot_dashboard(trainer, output_dir: str, window: int | None = None) -> str:
              fontsize=11, fontweight="bold", color=GREEN, ha="center",
              bbox=dict(facecolor=DARK_BG, edgecolor=GREEN,
                        boxstyle="round,pad=0.4", alpha=0.8))
-
     ax1.set_xlabel("Training Step", fontsize=11)
     ax1.set_ylabel("GRPO Reward", fontsize=11)
     ax1.set_title("Total Reward over Training", fontsize=13,
                   color=CYAN, pad=8, fontweight="bold")
     ax1.legend(fontsize=9, loc="lower right")
 
-    # ── Panel 2 (top-right): Before vs After task scores ───────────────────
-    ax2 = fig.add_subplot(gs[0, 2])
-    ax2.grid(axis="y", linewidth=0.5, alpha=0.4)
+    # ── Panel 2: Task scores (only if real scores supplied) ────────────────
+    if has_scores:
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax2.grid(axis="y", linewidth=0.5, alpha=0.4)
+        tasks = ["Task 1\n(Easy)", "Task 2\n(Surge)", "Task 3\n(Full Day)"]
+        x  = np.arange(len(tasks))
+        bw = 0.25
+        series = [
+            (task_scores["greedy"], DIM_C, "Greedy"),
+            (task_scores["before"], RED,   "Model (epoch 0)"),
+            (task_scores["after"],  GREEN, "Model (GRPO)"),
+        ]
+        for i, (vals, col, lbl) in enumerate(series):
+            ax2.bar(x + (i - 1) * bw, vals, width=bw,
+                    color=col, alpha=0.88, label=lbl)
+        for xi, th in zip(x, task_scores["thresh"]):
+            ax2.hlines(th, xi - 1.7 * bw, xi + 1.7 * bw,
+                       colors="white", linestyles=":", linewidth=1.1, alpha=0.5)
+            ax2.text(xi + 1.8 * bw, th, f"pass\n{th}",
+                     fontsize=6.5, color=DIM_C, va="center")
+        b_t2 = task_scores["before"][1]
+        a_t2 = task_scores["after"][1]
+        ax2.annotate("", xy=(x[1] + 0.5 * bw, a_t2 + 0.02),
+                     xytext=(x[1] - 0.5 * bw, b_t2 + 0.02),
+                     arrowprops=dict(arrowstyle="->", color=GREEN, lw=2.0))
+        ax2.text(x[1] + 0.55 * bw, (a_t2 + b_t2) / 2,
+                 f"+{a_t2 - b_t2:.0%}", color=GREEN, fontsize=7.5, fontweight="bold")
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(tasks, fontsize=9)
+        ax2.set_ylim(0, 1.12)
+        ax2.set_ylabel("Score", fontsize=10)
+        ax2.set_title("Task Scores\nBefore → After GRPO", fontsize=11,
+                      color=CYAN, pad=8, fontweight="bold")
+        ax2.legend(fontsize=7, loc="upper left",
+                   handlelength=1.2, handletextpad=0.5)
 
-    tasks = ["Task 1\n(Easy)", "Task 2\n(Surge)", "Task 3\n(Full Day)"]
-    x = np.arange(len(tasks))
-    bw = 0.20
-    series = [
-        (BASELINE_SCORES["greedy"], DIM_C,  "Greedy"),
-        (BASELINE_SCORES["before"], RED,    "Model (epoch 0)"),
-        (BASELINE_SCORES["after"],  GREEN,  "Model (GRPO)"),
-        (BASELINE_SCORES["gpt4o"],  AMBER,  "GPT-4o-mini"),
-    ]
-    for i, (vals, col, lbl) in enumerate(series):
-        ax2.bar(x + (i - 1.5) * bw, vals, width=bw,
-                color=col, alpha=0.88, label=lbl)
-
-    for xi, th in zip(x, BASELINE_SCORES["thresh"]):
-        ax2.hlines(th, xi - 2.2 * bw, xi + 2.2 * bw,
-                   colors="white", linestyles=":", linewidth=1.1, alpha=0.5)
-        ax2.text(xi + 2.3 * bw, th, f"pass\n{th}",
-                 fontsize=6.5, color=DIM_C, va="center")
-
-    b_t2 = BASELINE_SCORES["before"][1]
-    a_t2 = BASELINE_SCORES["after"][1]
-    ax2.annotate("", xy=(x[1] + 0.5 * bw, a_t2 + 0.02),
-                 xytext=(x[1] - 0.5 * bw, b_t2 + 0.02),
-                 arrowprops=dict(arrowstyle="->", color=GREEN, lw=2.0))
-    ax2.text(x[1] + 0.55 * bw, (a_t2 + b_t2) / 2,
-             f"+{a_t2 - b_t2:.0%}", color=GREEN, fontsize=7.5, fontweight="bold")
-
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(tasks, fontsize=9)
-    ax2.set_ylim(0, 1.12)
-    ax2.set_ylabel("Score", fontsize=10)
-    ax2.set_title("Task Scores\nBefore → After GRPO", fontsize=11,
-                  color=CYAN, pad=8, fontweight="bold")
-    ax2.legend(fontsize=6.5, loc="upper left",
-               handlelength=1.2, handletextpad=0.5)
-
-    # ── Panel 3 (bottom, 2-col): Reward signal decomposition ──────────────
-    ax3 = fig.add_subplot(gs[1, :2])
+    # ── Panel 3: Reward signal decomposition ──────────────────────────────
+    ax3 = fig.add_subplot(gs[1, 0])
     ax3.grid(axis="y", linewidth=0.5, alpha=0.4)
     for arr, col, lbl in [
         (s_fmt, PURPLE, "Format reward  — valid JSON output"),
@@ -493,11 +579,9 @@ def plot_dashboard(trainer, output_dir: str, window: int | None = None) -> str:
         (s_whl, AMBER,  "Wheel reward   — low-occupancy wheel pick"),
     ]:
         ax3.plot(s_x, arr, color=col, linewidth=2.0, label=lbl)
-    for arr, col, lbl in [
-        (s_fmt, PURPLE, "Format"),
-        (s_rte, TEAL,   "Routing"),
-        (s_whl, AMBER,  "Wheel"),
-    ]:
+    for arr, col, lbl in [(s_fmt, PURPLE, "Format"),
+                          (s_rte, TEAL,   "Routing"),
+                          (s_whl, AMBER,  "Wheel")]:
         ax3.text(s_x[-1] + steps_arr[-1] * 0.005, float(arr[-1]),
                  lbl, color=col, fontsize=8, va="center")
     ax3.axhline(0, color=DIM_C, linewidth=0.7, linestyle="--", alpha=0.5)
@@ -507,40 +591,37 @@ def plot_dashboard(trainer, output_dir: str, window: int | None = None) -> str:
                   fontsize=13, color=CYAN, pad=8, fontweight="bold")
     ax3.legend(fontsize=9, loc="lower right")
 
-    # ── Panel 4 (bottom-right): 9AM surge routing shift ───────────────────
-    ax4 = fig.add_subplot(gs[1, 2])
-    ax4.grid(axis="y", linewidth=0.5, alpha=0.4)
-
-    zone_labels = ["Z0\nCyber\nTowers", "Z1\nInorbit", "Z2\nMetro\nBuffer",
-                   "Z3\nMind-\nspace",  "Z4\nKonda-\npur"]
-    x4  = np.arange(len(zone_labels))
-    bw4 = 0.38
-    g_bars = ax4.bar(x4 - bw4 / 2, SURGE_ROUTING["greedy"],  width=bw4,
-                     color=RED,   alpha=0.82, label="Greedy")
-    t_bars = ax4.bar(x4 + bw4 / 2, SURGE_ROUTING["trained"], width=bw4,
-                     color=GREEN, alpha=0.82, label="Trained")
-
-    t_bars[2].set_edgecolor(CYAN);  t_bars[2].set_linewidth(2.8)
-    g_bars[0].set_edgecolor(PINK);  g_bars[0].set_linewidth(2.5)
-
-    ax4.annotate("Greedy saturates\nZone 0!",
-                 xy=(x4[0] - bw4 / 2, SURGE_ROUTING["greedy"][0]),
-                 xytext=(x4[0] - bw4 / 2 + 0.1, SURGE_ROUTING["greedy"][0] + 6),
-                 color=PINK, fontsize=7.5, fontweight="bold", ha="center",
-                 arrowprops=dict(arrowstyle="->", color=PINK, lw=1.2))
-    ax4.annotate("Trained uses\nbuffer zone!",
-                 xy=(x4[2] + bw4 / 2, SURGE_ROUTING["trained"][2]),
-                 xytext=(x4[2] + bw4 / 2 + 0.5, SURGE_ROUTING["trained"][2] + 6),
-                 color=CYAN, fontsize=7.5, fontweight="bold", ha="center",
-                 arrowprops=dict(arrowstyle="->", color=CYAN, lw=1.2))
-
-    ax4.set_xticks(x4)
-    ax4.set_xticklabels(zone_labels, fontsize=8)
-    ax4.set_ylabel("% of Cars Routed", fontsize=9)
-    ax4.set_ylim(0, 72)
-    ax4.set_title("9AM Surge Routing\nPredictive vs Reactive", fontsize=11,
-                  color=CYAN, pad=8, fontweight="bold")
-    ax4.legend(fontsize=9)
+    # ── Panel 4: Surge routing shift (only if real routing data supplied) ──
+    if has_surge:
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.grid(axis="y", linewidth=0.5, alpha=0.4)
+        zone_labels = ["Z0\nCyber\nTowers", "Z1\nInorbit", "Z2\nMetro\nBuffer",
+                       "Z3\nMind-\nspace",  "Z4\nKonda-\npur"]
+        x4  = np.arange(len(zone_labels))
+        bw4 = 0.38
+        g_bars = ax4.bar(x4 - bw4 / 2, surge_routing["greedy"],  width=bw4,
+                         color=RED,   alpha=0.82, label="Greedy")
+        t_bars = ax4.bar(x4 + bw4 / 2, surge_routing["trained"], width=bw4,
+                         color=GREEN, alpha=0.82, label="Trained")
+        t_bars[2].set_edgecolor(CYAN); t_bars[2].set_linewidth(2.8)
+        g_bars[0].set_edgecolor(PINK); g_bars[0].set_linewidth(2.5)
+        ax4.annotate("Greedy saturates\nZone 0!",
+                     xy=(x4[0] - bw4 / 2, surge_routing["greedy"][0]),
+                     xytext=(x4[0] - bw4 / 2 + 0.1, surge_routing["greedy"][0] + 6),
+                     color=PINK, fontsize=7.5, fontweight="bold", ha="center",
+                     arrowprops=dict(arrowstyle="->", color=PINK, lw=1.2))
+        ax4.annotate("Trained uses\nbuffer zone!",
+                     xy=(x4[2] + bw4 / 2, surge_routing["trained"][2]),
+                     xytext=(x4[2] + bw4 / 2 + 0.5, surge_routing["trained"][2] + 6),
+                     color=CYAN, fontsize=7.5, fontweight="bold", ha="center",
+                     arrowprops=dict(arrowstyle="->", color=CYAN, lw=1.2))
+        ax4.set_xticks(x4)
+        ax4.set_xticklabels(zone_labels, fontsize=8)
+        ax4.set_ylabel("% of Cars Routed", fontsize=9)
+        ax4.set_ylim(0, max(surge_routing["greedy"]) * 1.25)
+        ax4.set_title("9AM Surge Routing\nPredictive vs Reactive", fontsize=11,
+                      color=CYAN, pad=8, fontweight="bold")
+        ax4.legend(fontsize=9)
 
     # ── Save ───────────────────────────────────────────────────────────────
     out_path = os.path.join(output_dir, "training_dashboard.png")
