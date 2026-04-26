@@ -25,6 +25,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 class RPOEXEnvUI(RPOEXEnv):
+    SUPPORTS_CONCURRENT_SESSIONS = True
+
     def step(self, action: ParkingAction) -> OrchestratorObs:  # type: ignore[override]
         orch_action  = OrchestratorAction(action="route_to_zone", zone_id=action.zone_id)
         zone_action  = ZoneAction(action="assign_to_wheel", wheel_id=action.wheel_id)
