@@ -1,30 +1,38 @@
 """RPOE-X training utilities for GRPO with HF TRL.
 
-Importable as:
-    from rpoe_x.training.train import (
-        ZONE_WHEELS, ZONE_NAMES,
-        ORCH_SYSTEM, ZONE_SYSTEM,
-        RPOEXHTTPClient,
-        _obs_to_text, _zone_obs_to_text,
-        _greedy_zone_id, _greedy_wheel_id,
-        _proxy_step_reward,
-        reward_total,
-        build_rollout_func,
-        plot_rewards,
-        parse_action,
-    )
+Importable as: from rpoe_x.training.train import (
+    ORCH_SYSTEM, ZONE_SYSTEM,
+    format_orch_obs, format_zone_obs,
+    parse_action,
+    format_reward, routing_reward, wheel_reward,
+    collect_episode,
+    plot_rewards,
+)
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import random
 import re
 from typing import Any
 
 import numpy as np
-import requests
+
+try:
+    from ..models import ParkingAction
+except ImportError:
+    from models import ParkingAction
 
 logger = logging.getLogger(__name__)
+
+# ── Zone configuration ────────────────────────────────────────────────────────
+
+ZONE_WHEEL_COUNTS = [4, 4, 5, 4, 3]  # wheels per zone, matches server/env.py
+ZONE_NAMES = ["Cyber Towers", "Inorbit Mall", "Hitech Metro", "Mindspace", "Kondapur"]
+
+# ── System prompts ────────────────────────────────────────────────────────────
 
 # ── Zone configuration ────────────────────────────────────────────────────────
 
@@ -87,276 +95,259 @@ OUTPUT — respond with exactly this JSON and nothing else:
 {"wheel_id": <integer>}
 /no_think"""
 
-# ── Sync HTTP client ──────────────────────────────────────────────────────────
-
-class RPOEXHTTPClient:
-    """Thin sync HTTP client for RPOE-X — used in rollout and evaluation."""
-
-    def __init__(self, base_url: str, task_id: str = "task2_medium", timeout: int = 30):
-        self.base_url   = base_url.rstrip("/")
-        self.task_id    = task_id
-        self.timeout    = timeout
-        self.session_id = None
-
-    def reset(self, seed: int | None = None) -> dict:
-        payload: dict[str, Any] = {"task_id": self.task_id}
-        if seed is not None:
-            payload["seed"] = seed
-        r = requests.post(f"{self.base_url}/reset", json=payload, timeout=self.timeout)
-        r.raise_for_status()
-        data = r.json()
-        self.session_id = data.get("session_id")
-        return data
-
-    def step(self, action: str, zone_id: int, wheel_id: int | None = None) -> dict:
-        payload: dict[str, Any] = {"action": action, "zone_id": zone_id}
-        if wheel_id is not None:
-            payload["wheel_id"] = wheel_id
-        if self.session_id:
-            payload["session_id"] = self.session_id
-        r = requests.post(f"{self.base_url}/step", json=payload, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
-
-
 # ── Observation formatters ────────────────────────────────────────────────────
 
-def _obs_to_text(obs: dict) -> str:
-    """Format orchestrator observation for the model prompt."""
-    zone_occ = [round(x, 2) for x in obs.get("zone_occupancy", [])]
-    zone_q   = obs.get("zone_queue_lengths", [])
-    zone_w   = [round(x, 1) for x in obs.get("zone_avg_wait", [])]
+
+def format_orch_obs(obs: dict[str, Any]) -> str:
     return (
-        f"step={obs.get('step', 0)} time={round(obs.get('time_of_day', 0.0), 3)}\n"
-        f"zone_occupancy={zone_occ}\nzone_queue_lengths={zone_q}\nzone_avg_wait={zone_w}\n"
-        "Which zone_id (0-4) should the next car route to?"
+        f"zone_occupancy: {[round(x, 2) for x in obs['zone_occupancy']]}\n"
+        f"zone_queue_lengths: {obs['zone_queue_lengths']}\n"
+        f"zone_avg_wait: {[round(x, 1) for x in obs['zone_avg_wait']]}\n"
+        f"arrival_rate_ema: {[round(x, 3) for x in obs['arrival_rate_ema']]}\n"
+        f"time_of_day: {obs['time_of_day']:.3f}  step: {obs['step']}\n"
+        "Which zone_id (0-4) should the next car be routed to?"
     )
 
 
-def _zone_obs_to_text(obs: dict, zone_id: int) -> str:
-    """Format zone-level observation for the zone agent model prompt."""
-    n = ZONE_WHEELS[zone_id]
-    zone_obs_list = obs.get("zone_observations", [])
-    if zone_id < len(zone_obs_list):
-        z         = zone_obs_list[zone_id]
-        wheel_occ = [round(x, 2) for x in z.get("wheel_occupancy", [0.0] * n)]
-        wheel_q   = z.get("wheel_queue_lengths", [0] * n)
-        rot_cost  = [round(x, 1) for x in z.get("est_rotation_cost", [3.0] * n)]
-    else:
-        # Approximate from orchestrator-level obs when zone_observations is absent
-        occ       = obs.get("zone_occupancy", [0.0] * 5)[zone_id]
-        wheel_occ = [round(occ, 2)] * n
-        wheel_q   = [obs.get("zone_queue_lengths", [0] * 5)[zone_id] // max(n, 1)] * n
-        rot_cost  = [3.0] * n
-    tod = round(obs.get("time_of_day", 0.0), 3)
+def format_zone_obs(obs: dict[str, Any]) -> str:
+    n = len(obs["wheel_occupancy"])
     return (
-        f"zone_id={zone_id} n_wheels={n} time={tod}\n"
-        f"wheel_occupancy={wheel_occ}\n"
-        f"wheel_queue_lengths={wheel_q}\n"
-        f"est_rotation_cost={rot_cost}\n"
+        f"zone_id: {obs['zone_id']}\n"
+        f"wheel_occupancy: {[round(x, 2) for x in obs['wheel_occupancy']]}\n"
+        f"wheel_queue_lengths: {obs['wheel_queue_lengths']}\n"
+        f"est_rotation_cost: {[round(x, 1) for x in obs['est_rotation_cost']]}\n"
+        f"time_of_day: {obs['time_of_day']:.3f}  step: {obs['step']}\n"
         f"Which wheel_id (0-{n - 1}) should the car be assigned to?"
     )
 
 
-# ── Greedy baselines ──────────────────────────────────────────────────────────
+# ── Action parser ─────────────────────────────────────────────────────────────
 
-def _greedy_zone_id(obs: dict) -> int:
-    """Route to the zone with the highest queue depth (lowest occupancy breaks ties)."""
-    queues = obs.get("zone_queue_lengths", [0] * 5)
-    occs   = obs.get("zone_occupancy", [0.0] * 5)
-    max_q  = max(queues) if queues else 0
-    if max_q == 0:
-        return 2  # default to Metro buffer when system is idle
-    candidates = [i for i, q in enumerate(queues) if q == max_q]
-    return min(candidates, key=lambda i: occs[i])
-
-
-def _greedy_wheel_id(zone_id: int, obs: dict) -> int:
-    """Pick wheel with lowest filled-slots + rotation-cost composite."""
-    n = ZONE_WHEELS[zone_id]
-    zone_obs_list = obs.get("zone_observations", [])
-    if zone_id < len(zone_obs_list):
-        z        = zone_obs_list[zone_id]
-        wheel_q  = z.get("wheel_queue_lengths", [0] * n)
-        rot_cost = z.get("est_rotation_cost", [3.0] * n)
-        return min(range(n), key=lambda w: wheel_q[w] + rot_cost[w])
-    return 0
-
-
-# ── Proxy step reward ─────────────────────────────────────────────────────────
-
-def _proxy_step_reward(pre_obs: dict, post_obs: dict, zone_id: int) -> float:
-    """Observation-based proxy reward — always in [0, 1], always has variance.
-
-    Raw env step rewards are dominated by -avg_wait_time and sum to a large
-    negative value over 50 steps, clamping to 0 after normalisation and
-    producing zero GRPO gradient. This proxy uses observable state instead.
-
-    routing_score : 1.0 if the chosen zone had queued cars before the step.
-                    Direct proxy for task1 service rate. Has structural variance
-                    because different model decisions pick different zones.
-    balance_score : 1 - std(zone_occupancy) / 0.5. Always non-zero (floor ~0.3)
-                    so reward_std never collapses to 0 in quiet periods.
-
-    Expected range:
-        early morning, bad routing  → ~0.24
-        morning surge, good routing → ~0.70+
-    """
-    pre_q = pre_obs.get("zone_queue_lengths", [0] * 5)
-    routing_score = 1.0 if zone_id < len(pre_q) and pre_q[zone_id] > 0 else 0.0
-
-    occ      = post_obs.get("zone_occupancy", [0.5] * 5)
-    mean_occ = sum(occ) / len(occ) if occ else 0.5
-    std_occ  = (sum((x - mean_occ) ** 2 for x in occ) / len(occ)) ** 0.5 if occ else 0.0
-    balance_score = max(0.0, 1.0 - std_occ / 0.5)
-
-    return 0.7 * routing_score + 0.3 * balance_score
-
-
-# ── TRL reward function ───────────────────────────────────────────────────────
-
-def reward_total(completions: list, **kwargs) -> list[float]:
-    """Pass-through reward: reads the reward baked into each completion dict.
-
-    rollout_func returns completions as {"reward": float, "content": str}.
-    reward_total extracts those values so TRL can log and use them for GRPO.
-    """
-    return [
-        float(c.get("reward", 0.0)) if isinstance(c, dict) else 0.0
-        for c in completions
-    ]
-
-
-# ── Rollout function ──────────────────────────────────────────────────────────
-
-def build_rollout_func(env_url: str, tokenizer, max_turns: int = 50):
-    """Return a GRPOTrainer-compatible rollout_func.
-
-    Single shared model, dual role per env step:
-      1. Called with ORCH_SYSTEM → picks zone_id  (orchestrator)
-      2. Called with ZONE_SYSTEM → picks wheel_id (zone agent)
-
-    Reward: _proxy_step_reward() summed over turns, divided by max_turns.
-    Structurally in [0, 1] with real variance even during quiet periods.
-    """
-    import torch
-
-    _device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    def _infer(model, tok, messages: list[dict], lo: int, hi: int) -> int:
-        prompt = tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inp = tok(prompt, return_tensors="pt").to(_device)
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            out = model.generate(
-                **inp, max_new_tokens=16, temperature=0.9,
-                do_sample=True, pad_token_id=tok.eos_token_id,
-            )
-        if was_training:
-            model.train()
-        text = tok.decode(out[0][inp["input_ids"].shape[1]:], skip_special_tokens=True)
-        for d in re.findall(r"\b(\d+)\b", text):
-            if lo <= int(d) <= hi:
-                return int(d)
-        return lo  # fallback: lowest valid index
-
-    def _rollout(prompts, model=None, processing_class=None, **kwargs):
-        tok = processing_class or tokenizer
-        all_completions, all_rewards = [], []
-        for _ in prompts:
-            client    = RPOEXHTTPClient(base_url=env_url, task_id="task2_medium")
-            data      = client.reset()
-            obs       = data.get("observation", {})
-            ep_reward = 0.0
-            turns     = 0
-            text      = ""  # compact action log: "z,w;" — stays well under token limit
-            while not obs.get("done", False) and turns < max_turns:
-                pre_obs  = obs
-                zone_id  = _infer(model, tok, [
-                    {"role": "system", "content": ORCH_SYSTEM},
-                    {"role": "user",   "content": _obs_to_text(obs)},
-                ], lo=0, hi=4)
-                n_wheels = ZONE_WHEELS[zone_id]
-                wheel_id = _infer(model, tok, [
-                    {"role": "system", "content": ZONE_SYSTEM},
-                    {"role": "user",   "content": _zone_obs_to_text(obs, zone_id)},
-                ], lo=0, hi=n_wheels - 1)
-                resp      = client.step("route_to_zone", zone_id, wheel_id=wheel_id)
-                obs       = resp.get("observation", {})
-                ep_reward += _proxy_step_reward(pre_obs, obs, zone_id)
-                text      += f"{zone_id},{wheel_id};"
-                turns     += 1
-
-            normalised = min(1.0, ep_reward / max(max_turns, 1))
-            all_completions.append({"reward": normalised, "content": text})
-            all_rewards.append(normalised)
-        return all_completions, all_rewards
-
-    return _rollout
-
-
-# ── Reward curve plotter ──────────────────────────────────────────────────────
-
-def plot_rewards(trainer, save_path: str | None = None) -> None:
-    """Plot GRPO reward and loss curves from trainer log history."""
-    import matplotlib.pyplot as plt
-    import pandas as pd
-
-    log_df      = pd.DataFrame(trainer.state.log_history)
-    reward_cols = [c for c in log_df.columns if "reward" in c.lower()]
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-
-    for col in reward_cols:
-        if "step" in log_df.columns:
-            axes[0].plot(log_df["step"], log_df[col], alpha=0.7, label=col)
-    if "step" in log_df.columns and reward_cols:
-        smoothed = log_df[reward_cols[0]].rolling(10, min_periods=1).mean()
-        axes[0].plot(log_df["step"], smoothed, linewidth=2.5, color="darkblue", label="smoothed")
-    axes[0].set_title("GRPO Reward")
-    axes[0].set_xlabel("Step")
-    axes[0].set_ylabel("Reward")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True, alpha=0.3)
-
-    if "loss" in log_df.columns and "step" in log_df.columns:
-        axes[1].plot(log_df["step"], log_df["loss"], color="orange", label="loss")
-        axes[1].set_title("Training Loss")
-        axes[1].set_xlabel("Step")
-        axes[1].set_ylabel("Loss")
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=120)
-        print(f"Saved to {save_path}")
-    plt.show()
-
-
-# ── JSON action parser ────────────────────────────────────────────────────────
 
 def parse_action(completion: str) -> dict[str, Any] | None:
-    """Parse JSON action from model output, stripping Qwen <think> blocks."""
+    """Parse JSON action from model output, stripping Qwen <think> chains."""
     if not isinstance(completion, str):
         return None
-    import json
     text = re.sub(r"<think>.*?</think>", "", completion, flags=re.DOTALL).strip()
-    text = re.sub(r"```.*?```",          "", text,       flags=re.DOTALL).strip()
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL).strip()
     try:
         result = json.loads(text)
         if isinstance(result, dict):
             return result
     except json.JSONDecodeError:
         pass
-    for match in re.findall(r"\{[^{}]*\}", text):
+    matches = re.findall(r"\{[^{}]*\}", text)
+    if matches:
         try:
-            result = json.loads(match)
+            result = json.loads(matches[-1])
             if isinstance(result, dict):
                 return result
         except json.JSONDecodeError:
-            continue
+            pass
     return None
+
+
+# ── Reward functions ──────────────────────────────────────────────────────────
+
+
+def format_reward(completions: list[str], agent_role: list[str], **kwargs) -> list[float]:
+    """Reward valid JSON with the correct key for each agent role."""
+    rewards = []
+    for comp, role in zip(completions, agent_role):
+        parsed = parse_action(comp)
+        if parsed is None:
+            rewards.append(-1.0)
+        elif role == "orchestrator" and "zone_id" in parsed:
+            z = int(parsed.get("zone_id", -1))
+            rewards.append(0.5 if 0 <= z <= 4 else -1.0)
+        elif role == "zone" and "wheel_id" in parsed:
+            w = int(parsed.get("wheel_id", -1))
+            rewards.append(0.5 if w >= 0 else -1.0)
+        else:
+            rewards.append(-1.0)
+    return rewards
+
+
+def routing_reward(
+    completions: list[str],
+    agent_role: list[str],
+    zone_queue_lengths: list[str],
+    **kwargs,
+) -> list[float]:
+    """Reward routing to zones with queued cars; penalise routing to empty zones.
+
+    zone_queue_lengths is stored as a JSON string in the dataset to avoid
+    TRL collation errors with variable-length lists.
+    """
+    rewards = []
+    for comp, role, ql_raw in zip(completions, agent_role, zone_queue_lengths):
+        ql = json.loads(ql_raw) if isinstance(ql_raw, str) else ql_raw
+        if role != "orchestrator" or not ql:
+            rewards.append(0.0)
+            continue
+        parsed = parse_action(comp)
+        if parsed is None or "zone_id" not in parsed:
+            rewards.append(-0.5)
+            continue
+        z = int(parsed["zone_id"])
+        if not (0 <= z <= 4):
+            rewards.append(-1.0)
+            continue
+        total = sum(ql)
+        if total == 0:
+            rewards.append(0.0)
+        elif ql[z] == 0:
+            rewards.append(-0.5)
+        else:
+            rewards.append(min(1.0, ql[z] / total + 0.3))
+    return rewards
+
+
+def wheel_reward(
+    completions: list[str],
+    agent_role: list[str],
+    wheel_occupancy: list[str],
+    n_wheels: list[int],
+    **kwargs,
+) -> list[float]:
+    """Penalise full-wheel assignments; reward choosing low-occupancy wheels.
+
+    wheel_occupancy is stored as a JSON string in the dataset to avoid
+    TRL collation errors with variable-length lists.
+    """
+    rewards = []
+    for comp, role, occ_raw, nw in zip(completions, agent_role, wheel_occupancy, n_wheels):
+        occ = json.loads(occ_raw) if isinstance(occ_raw, str) else occ_raw
+        if role != "zone" or not occ:
+            rewards.append(0.0)
+            continue
+        parsed = parse_action(comp)
+        if parsed is None or "wheel_id" not in parsed:
+            rewards.append(-0.5)
+            continue
+        w = int(parsed["wheel_id"])
+        if not (0 <= w < nw):
+            rewards.append(-1.0)
+            continue
+        occ_val = occ[w]
+        rewards.append(-0.8 if occ_val >= 0.99 else max(0.5, 1.0 - occ_val))
+    return rewards
+
+
+# ── Episode collector ─────────────────────────────────────────────────────────
+
+
+async def collect_episode(env, tokenizer, max_turns: int = 50) -> list[dict]:
+    """Run one greedy episode; return rows for GRPO training.
+
+    The prompt column is pre-formatted via tokenizer.apply_chat_template so
+    it's stored as a string — TRL's GRPOTrainer requires a string prompt column.
+
+    Variable-length list columns (zone_queue_lengths, wheel_occupancy) are
+    JSON-serialised to avoid TRL batch-collation errors.
+    """
+    rows = []
+    result = await env.reset()
+    obs = result.observation
+    done = False
+
+    for _ in range(max_turns):
+        if done:
+            break
+        ql = list(obs.zone_queue_lengths)
+        zo = list(obs.zone_occupancy)
+
+        # Orchestrator training row
+        orch_obs_dict = {
+            "zone_occupancy": zo,
+            "zone_queue_lengths": ql,
+            "zone_avg_wait": list(obs.zone_avg_wait),
+            "arrival_rate_ema": list(obs.arrival_rate_ema),
+            "time_of_day": obs.time_of_day,
+            "step": obs.step,
+        }
+        orch_messages = [
+            {"role": "system", "content": ORCH_SYSTEM},
+            {"role": "user", "content": format_orch_obs(orch_obs_dict)},
+        ]
+        rows.append({
+            "prompt": tokenizer.apply_chat_template(
+                orch_messages, add_generation_prompt=True, tokenize=False
+            ),
+            "agent_role": "orchestrator",
+            "zone_queue_lengths": json.dumps(ql),
+            "wheel_occupancy": json.dumps([]),
+            "n_wheels": 0,
+        })
+
+        # Greedy zone selection; estimate wheel occupancy from zone-level signal
+        zone_id = max(range(5), key=lambda z: ql[z])
+        n_wheels = ZONE_WHEEL_COUNTS[zone_id]
+        base_occ = zo[zone_id]
+        wheel_occ = [
+            max(0.0, min(1.0, base_occ + random.gauss(0, 0.15)))
+            for _ in range(n_wheels)
+        ]
+        if all(w > 0.9 for w in wheel_occ):
+            wheel_occ[random.randint(0, n_wheels - 1)] = random.uniform(0.1, 0.5)
+
+        zone_obs_dict = {
+            "zone_id": zone_id,
+            "wheel_occupancy": wheel_occ,
+            "wheel_queue_lengths": [max(0, int(w * 12)) for w in wheel_occ],
+            "est_rotation_cost": [max(1.0, (1.0 - w) * 12) for w in wheel_occ],
+            "time_of_day": obs.time_of_day,
+            "step": obs.step,
+        }
+        zone_messages = [
+            {"role": "system", "content": ZONE_SYSTEM},
+            {"role": "user", "content": format_zone_obs(zone_obs_dict)},
+        ]
+        rows.append({
+            "prompt": tokenizer.apply_chat_template(
+                zone_messages, add_generation_prompt=True, tokenize=False
+            ),
+            "agent_role": "zone",
+            "zone_queue_lengths": json.dumps([]),
+            "wheel_occupancy": json.dumps(wheel_occ),
+            "n_wheels": n_wheels,
+        })
+
+        wheel_id = min(range(n_wheels), key=lambda w: wheel_occ[w])
+        step_result = await env.step(ParkingAction(zone_id=zone_id, wheel_id=wheel_id))
+        obs = step_result.observation
+        done = step_result.done
+
+    return rows
+
+
+# ── Reward curve plotter ──────────────────────────────────────────────────────
+
+
+def plot_rewards(trainer, save_path: str) -> None:
+    """Save and display the GRPO reward curve from trainer log history."""
+    import matplotlib.pyplot as plt
+
+    steps, rewards = [], []
+    for log in trainer.state.log_history:
+        if "step" in log and "reward" in log:
+            steps.append(log["step"])
+            rewards.append(log["reward"])
+    if not rewards:
+        print("No reward data to plot.")
+        return
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(steps, rewards, color="steelblue", alpha=0.6, linewidth=1, label="Per-step")
+    if len(rewards) >= 10:
+        smoothed = np.convolve(rewards, np.ones(10) / 10, mode="valid")
+        ax.plot(steps[9:], smoothed, color="darkblue", linewidth=2.5, label="Smoothed (10-step)")
+    ax.axhline(0, color="gray", linestyle="--", linewidth=0.8)
+    ax.set_xlabel("Training Step")
+    ax.set_ylabel("GRPO Reward")
+    ax.set_title("RPOE-X — GRPO Training Reward Curve")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"Reward curve saved to {save_path}")

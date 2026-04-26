@@ -40,7 +40,7 @@ app = create_app(
     ParkingAction,
     OrchestratorObs,
     env_name="rpoe-x",
-    max_concurrent_envs=1,
+    max_concurrent_envs=64,
 )
 
 
